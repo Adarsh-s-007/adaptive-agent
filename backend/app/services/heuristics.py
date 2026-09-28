@@ -163,7 +163,9 @@ def extract(turns: list[ParsedTurn], max_candidates: int = 8) -> ExtractionOutpu
         joined = " ".join(rule_sentences)
         memory_type = next((t for t, rx in TYPE_RULES if rx.search(joined)), "decision")
         title_src = LEADS.sub("", strongest, count=1).strip() or strongest
-        title = re.split(r"[:;(]", title_src)[0].strip().rstrip(".")[:72]
+        title = re.split(r"[:;(—]", title_src)[0].strip().rstrip(".")
+        if len(title) > 72:
+            title = title[:72].rsplit(" ", 1)[0].rstrip(" ,.;:")
         has_reason = bool(SIGNAL_PATTERNS["rationale"].search(turn.content))
         candidates.append(
             ExtractedCandidate(

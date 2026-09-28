@@ -302,30 +302,51 @@ export function Modal({ open, onClose, children, width }: { open: boolean; onClo
 }
 
 // ------------------------------------------------------------------ code
-const KEYWORDS = /\b(import|from|export|default|const|let|var|function|async|await|return|if|else|for|while|new|class|extends|try|catch|throw|type|interface|def|self|None|True|False|null|undefined|true|false)\b/g;
+const TOKEN =
+  /(\/\/[^\n]*|^\s*#[^\n]*)|("[^"\n]*"|'[^'\n]*'|`[^`]*`)|\b(import|from|export|default|const|let|var|function|async|await|return|if|else|for|while|new|class|extends|try|catch|throw|type|interface|def|self|None|True|False|null|undefined|true|false)\b|\b(\d+)\b/gm;
+
+function esc(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Single-pass tokenizer: never re-scans its own HTML output. */
+function tokenize(code: string): string {
+  let out = "";
+  let last = 0;
+  for (const m of code.matchAll(TOKEN)) {
+    const idx = m.index ?? 0;
+    out += esc(code.slice(last, idx));
+    const cls = m[1] ? "tok-c" : m[2] ? "tok-s" : m[3] ? "tok-k" : "tok-n";
+    out += `<span class="${cls}">${esc(m[0])}</span>`;
+    last = idx + m[0].length;
+  }
+  return out + esc(code.slice(last));
+}
 
 function highlight(code: string, marks: { text: string; tone: "bad" | "ok" }[] = []): string {
-  const esc = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  let html = esc
-    .replace(/(\/\/[^\n]*|#[^\n{]*$)/gm, '<span class="tok-c">$1</span>')
-    .replace(/("[^"\n]*"|'[^'\n]*'|`[^`]*`)/g, '<span class="tok-s">$1</span>')
-    .replace(KEYWORDS, '<span class="tok-k">$1</span>')
-    .replace(/\b(\d+)\b/g, '<span class="tok-n">$1</span>');
+  // Mark ranges first (e.g. violating excerpts), tokenize everything between them.
+  const ranges: { start: number; end: number; tone: string }[] = [];
   for (const mark of marks) {
-    const needle = mark.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    if (needle.length < 3) continue;
-    const plain = html.replace(/<[^>]+>/g, "");
-    if (!plain.includes(needle)) continue;
-    // Re-render the plain text with the excerpt marked (drops token colours only on that line).
-    html = html
-      .split("\n")
-      .map((line) => {
-        const text = line.replace(/<[^>]+>/g, "");
-        return text.includes(needle) ? text.split(needle).join(`<span class="hl-${mark.tone}">${needle}</span>`) : line;
-      })
-      .join("\n");
+    if (mark.text.length < 3) continue;
+    let from = 0;
+    for (;;) {
+      const i = code.indexOf(mark.text, from);
+      if (i < 0) break;
+      if (!ranges.some((r) => i < r.end && i + mark.text.length > r.start)) {
+        ranges.push({ start: i, end: i + mark.text.length, tone: mark.tone });
+      }
+      from = i + mark.text.length;
+    }
   }
-  return html;
+  ranges.sort((x, y) => x.start - y.start);
+  let out = "";
+  let pos = 0;
+  for (const r of ranges) {
+    out += tokenize(code.slice(pos, r.start));
+    out += `<span class="hl-${r.tone}">${esc(code.slice(r.start, r.end))}</span>`;
+    pos = r.end;
+  }
+  return out + tokenize(code.slice(pos));
 }
 
 export function CodeBlock({ code, path, language, marks }: { code: string; path?: string; language?: string; marks?: { text: string; tone: "bad" | "ok" }[] }) {
@@ -344,12 +365,17 @@ export function CodeBlock({ code, path, language, marks }: { code: string; path?
 
 // ------------------------------------------------------------------ markdown
 function inline(text: string): string {
+  // Code spans are rendered verbatim; emphasis rules only apply outside them.
   return text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/_([^_\n]+)_/g, "<em>$1</em>");
+    .split(/(`[^`]+`)/g)
+    .map((part) => {
+      if (part.startsWith("`") && part.endsWith("`") && part.length > 1) return `<code>${esc(part.slice(1, -1))}</code>`;
+      return esc(part)
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+        .replace(/(^|\s)_([^_\n]+)_(?=\s|[.,;:!?)]|$)/g, "$1<em>$2</em>");
+    })
+    .join("");
 }
 
 export function Markdown({ text }: { text: string }) {

@@ -217,6 +217,9 @@ function TopBar({ pid, onSearch }: { pid: string; onSearch: () => void }) {
 
 function Banners({ pid }: { pid: string }) {
   const status = useStatus();
+  const [llmBannerHidden, setLlmBannerHidden] = useState(() => {
+    try { return sessionStorage.getItem("pp.hide-llm-banner") === "1"; } catch { return false; }
+  });
   const project = useProject(pid);
   const hs = status.data?.hindsight.status;
   const llm = status.data?.llm.status;
@@ -228,8 +231,10 @@ function Banners({ pid }: { pid: string }) {
       {hs && hs !== "ok" && (
         <div className="banner bad"><AlertTriangle /><span>Hindsight is {hs === "offline" ? "forced offline" : "unreachable"}: Brief, Check and Ask are unavailable, approvals queue as “Waiting to sync”, baseline runs still work. Nothing pretends memory was used.</span></div>
       )}
-      {llm && llm !== "ok" && (
-        <div className="banner warn"><KeyRound /><span>No LLM configured (set <code>GROQ_API_KEY</code>). Memory, recall, review and Ask work; generation and Compare are disabled; extraction, filtering and Check use labelled deterministic heuristics.</span></div>
+      {llm && llm !== "ok" && !llmBannerHidden && (
+        <div className="banner warn"><KeyRound /><span style={{ flex: 1 }}>No LLM configured (set <code>GROQ_API_KEY</code>). Memory, recall, review and Ask work; generation and Compare are disabled; extraction, filtering and Check use labelled deterministic heuristics.</span>
+          <button className="btn xs ghost" aria-label="Dismiss" onClick={() => { setLlmBannerHidden(true); try { sessionStorage.setItem("pp.hide-llm-banner", "1"); } catch { /* ignore */ } }}>Dismiss</button>
+        </div>
       )}
       {project.data?.bank_status === "error" && (
         <div className="banner bad"><AlertTriangle /><span>This project's Hindsight bank is not ready: {project.data.bank_error}. Reprovision it in Settings.</span></div>

@@ -102,6 +102,11 @@ function SessionView({ pid, sid }: { pid: string; sid: string }) {
     return null;
   }, [s, liveBrief]);
 
+  const preview = useMutation({
+    mutationFn: (content: string) => api.brief(pid, content),
+    onSuccess: (b) => setLiveBrief(b),
+    onError: (e) => toast.error(e),
+  });
   const send = useMutation({
     mutationFn: (content: string) => api.sendMessage(pid, sid, { content, use_memory: useMemory }),
     onMutate: (content) => { setPendingHuman(content); setText(""); },
@@ -169,15 +174,16 @@ function SessionView({ pid, sid }: { pid: string; sid: string }) {
             <textarea
               className="textarea"
               style={{ border: 0, background: "transparent", boxShadow: "none", minHeight: 70 }}
-              placeholder={llmReady ? "Describe the task… (Ctrl+Enter to send)" : "Generation needs GROQ_API_KEY on the server."}
+              placeholder={llmReady ? "Describe the task… (Ctrl+Enter to send)" : "Describe a task and Preview brief — sending needs GROQ_API_KEY on the server."}
               value={text}
-              disabled={!llmReady || send.isPending}
+              disabled={send.isPending}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && text.trim().length > 2) send.mutate(text.trim()); }}
             />
             <div className="row">
               <Toggle on={useMemory} onChange={setUseMemory} label="Use project memory" />
               <span className="spacer" />
+              <Button icon={Radar} loading={preview.isPending} disabled={text.trim().length < 3} onClick={() => preview.mutate(text.trim())} title="Recall + applicability only — no generation">Preview brief</Button>
               <Button variant="primary" icon={Send} loading={send.isPending} disabled={!llmReady || text.trim().length < 3} onClick={() => send.mutate(text.trim())}>Send</Button>
             </div>
           </div>

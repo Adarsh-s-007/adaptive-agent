@@ -1,0 +1,14 @@
+Your coding agent doesn't need more memory.
+It needs memory that went through code review.
+
+Agents keep re-proposing decisions the team already rejected. So I built ProjectPulse on Hindsight agent memory, which gave me hybrid recall for free so I could focus on governance:
+
+1. Extract: each rule needs a verbatim quote. No quote, no memory.
+2. Review: a human approves. Chatter gets filtered, with reasons.
+3. Brief: max 5 rules, each with a reason. A dark-mode task gets the UI rule, not auth.
+4. Supersede: retag, never delete.
+5. Check the output. Before: token in localStorage. After: compliant.
+
+Repo: https://github.com/Adarsh-s-007/adaptive-agent
+
+#AIAgents #AgentMemory #Hindsight #LLM
