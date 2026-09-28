@@ -1,5 +1,6 @@
 ﻿import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import "./enhancements.css";
 import "./styles.css";
 import "./overrides.css";
 import "./mcp.css";

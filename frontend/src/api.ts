@@ -114,6 +114,13 @@ export type McpDemo = {
   mode_label: string;
 };
 
+export type RecallResult = {
+  memories: Memory[];
+  event: Event;
+  used_bank_id: string;
+  origin: "demo" | "hindsight";
+};
+
 export const api = {
   health: () => request<Health>("/health"),
   projects: () => request<Project[]>("/projects"),
@@ -131,6 +138,15 @@ export const api = {
     request<{ event: Event; memory: Memory; origin: string }>(`/projects/${id}/memories`, {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  recall: (id: string, body: { task: string; limit?: number; agentName?: string }) =>
+    request<RecallResult>(`/projects/${id}/recall`, {
+      method: "POST",
+      body: JSON.stringify({
+        task: body.task,
+        limit: body.limit || 5,
+        agent_name: body.agentName || "Workspace agent",
+      }),
     }),
   runMcpDemo: (id: string) =>
     request<McpDemo>(`/projects/${id}/run-mcp-demo`, { method: "POST" }),

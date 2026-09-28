@@ -43,6 +43,7 @@ class MemoryCreate(BaseModel):
 class RecallRequest(BaseModel):
     task: Task
     limit: int = Field(default=5, ge=1, le=10)
+    agent_name: AgentName = "Workspace agent"
 
 
 class AgentAnswerRequest(RecallRequest):

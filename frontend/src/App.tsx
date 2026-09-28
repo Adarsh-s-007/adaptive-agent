@@ -1,4 +1,4 @@
-﻿import { FormEvent, useEffect, useMemo, useState } from "react";
+﻿import { FormEvent, lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   api,
@@ -10,9 +10,13 @@ import {
   Project,
   Stats,
 } from "./api";
+import { hasWebGL } from "./three/support";
 
-type Tab = "overview" | "timeline" | "activity" | "setup";
+const SceneBackground = lazy(() => import("./three/SceneBackground"));
+
+type Tab = "overview" | "workspace" | "timeline" | "activity" | "setup";
 type Target = "Claude Code" | "GitHub Copilot";
+type WorkspaceAgent = "Codex" | "Claude Code" | "GitHub Copilot" | "Agent B - simulated";
 
 const EMPTY_STATS: Stats = { retained: 0, recalled: 0, decisions: 0, bug_fixes: 0 };
 const JWT_EXAMPLE =
@@ -41,6 +45,7 @@ function eventText(event: Event): string {
 }
 
 export default function App() {
+  const show3dScene = useMemo(() => hasWebGL(), []);
   const [projects, setProjects] = useState<Project[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -59,6 +64,11 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [retry, setRetry] = useState<(() => void) | null>(null);
   const [demoResult, setDemoResult] = useState<McpDemo | null>(null);
+  const [workspaceAgent, setWorkspaceAgent] = useState<WorkspaceAgent>("Codex");
+  const [workspaceTask, setWorkspaceTask] = useState(
+    "Implement the login and refresh-token authentication flow."
+  );
+  const [workspaceMemories, setWorkspaceMemories] = useState<Memory[] | null>(null);
 
   async function loadProject(next: Project) {
     const [nextEvents, nextStats, nextMemories, nextActivities] = await Promise.all([
@@ -172,6 +182,21 @@ export default function App() {
     });
   }
 
+  function prepareWorkspaceContext() {
+    if (!project) return;
+    void perform("workspace", async () => {
+      const result = await api.recall(project.id, {
+        task: workspaceTask,
+        agentName: workspaceAgent,
+      });
+      setWorkspaceMemories(result.memories);
+      await loadProject(project);
+      setNotice(
+        "Prepared " + result.memories.length + " relevant project memories for " + workspaceAgent + "."
+      );
+    });
+  }
+
   async function copy(value: string) {
     try {
       await navigator.clipboard.writeText(value);
@@ -231,16 +256,18 @@ export default function App() {
       }, null, 2);
 
   return (
-    <main>
+    <>
+      {show3dScene && <Suspense fallback={null}><SceneBackground /></Suspense>}
+      <main>
       <header>
         <div className="brand">
-          <span className="logo">{"\u2726"}</span>
+          <span className="logo" data-anchor="brand">{"\u2726"}</span>
           <span>Project<span>Pulse</span></span>
           <em>Cross-agent engineering memory</em>
         </div>
         <div className="head-actions">
           <span className={"live " + (isDemo ? "setup" : "")}>
-            <i /> {status.toUpperCase()}
+            <i data-anchor="beacon" /> {status.toUpperCase()}
           </span>
           <button className="ghost" onClick={() => setModal("project")}>+ New project</button>
         </div>
@@ -327,9 +354,17 @@ export default function App() {
             </div>
           </section>
 
-          <nav className="section-nav" aria-label="Dashboard sections">
+          <div className="dashboard-shell">
+            <aside className="dashboard-sidebar">
+              <div className="sidebar-project">
+                <p className="eyebrow">ACTIVE PROJECT</p>
+                <strong>{project.name}</strong>
+                <small>{project.memory_mode === "hindsight" ? "Hindsight bank connected" : "Local demo memory"}</small>
+              </div>
+              <nav className="section-nav" aria-label="Dashboard sections">
             {([
               ["overview", "Overview"],
+              ["workspace", "Agent workspace"],
               ["timeline", "Memory timeline"],
               ["activity", "Agent activity"],
               ["setup", "MCP setup"],
@@ -340,8 +375,13 @@ export default function App() {
                 onClick={() => setTab(key)}
               >{label}</button>
             ))}
-          </nav>
-
+              </nav>
+              <div className="sidebar-help">
+                <span>Project memory is scoped to this bank.</span>
+                <button className="ghost" onClick={() => setModal("memory")}>+ Retain memory</button>
+              </div>
+            </aside>
+            <div className="dashboard-content">
           {tab === "overview" && (
             <section className="tab-content">
               <div className="overview-grid">
@@ -382,6 +422,93 @@ export default function App() {
                   {busy === "mcp" ? "Calling MCP tool..." : "Run fresh Agent B MCP demo"}
                 </button>
               </div>
+            </section>
+          )}
+
+          {tab === "workspace" && (
+            <section className="tab-content agent-stage">
+              <div className="workspace-hero">
+                <div>
+                  <p className="eyebrow">PROJECTPULSE CONTEXT GATEWAY</p>
+                  <h2>Give a fresh coding agent the context it needs.</h2>
+                  <p>ProjectPulse retrieves only the relevant engineering decisions before the agent starts work.</p>
+                </div>
+                <span className="workspace-badge">{project.memory_mode === "hindsight" ? "Live Hindsight memory" : "Local demo memory"}</span>
+              </div>
+
+              <div className="agent-rail">
+                <div className="rail-label">
+                  <span>01</span>
+                  <div><strong>Choose an agent</strong><small>Context is prepared for its next task.</small></div>
+                </div>
+                <div className="agent-cards">
+                  {(["Codex", "Claude Code", "GitHub Copilot", "Agent B - simulated"] as WorkspaceAgent[]).map((agent) => (
+                    <button
+                      key={agent}
+                      className={workspaceAgent === agent ? "selected" : ""}
+                      onClick={() => setWorkspaceAgent(agent)}
+                    >
+                      <span className="agent-mark">{agent === "Codex" ? "C" : agent === "Claude Code" ? "A" : agent === "GitHub Copilot" ? "GH" : "B"}</span>
+                      <span><strong>{agent}</strong><small>{agent === "Agent B - simulated" ? "In-dashboard proof" : "MCP-capable client"}</small></span>
+                      {workspaceAgent === agent && <i>Selected</i>}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="task-composer">
+                <div className="composer-head">
+                  <div><span>02</span><strong>What should {workspaceAgent} work on?</strong></div>
+                  <small>Scoped to {project.name}</small>
+                </div>
+                <textarea
+                  aria-label="Task for selected agent"
+                  value={workspaceTask}
+                  onChange={(event) => setWorkspaceTask(event.target.value)}
+                  minLength={3}
+                  placeholder="Describe the implementation task..."
+                />
+                <div className="composer-actions">
+                  <span>Hindsight searches this project only</span>
+                  <div>
+                    {workspaceAgent !== "Agent B - simulated" && <button className="ghost" onClick={() => setTab("setup")}>MCP setup</button>}
+                    <button className="primary" onClick={prepareWorkspaceContext} disabled={!!busy || workspaceTask.trim().length < 3}>
+                      {busy === "workspace" ? "Retrieving context..." : "Retrieve project context"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="comparison-head">
+                <div><p className="eyebrow">03. THE DIFFERENCE PROJECT MEMORY MAKES</p><h3>Fresh agent guidance, side by side.</h3></div>
+                {workspaceMemories !== null && <span className={workspaceMemories.length ? "memory-count" : "memory-count empty-count"}>{workspaceMemories.length} relevant {workspaceMemories.length === 1 ? "memory" : "memories"}</span>}
+              </div>
+              <div className="context-comparison">
+                <article className="without-context">
+                  <div className="comparison-card-head"><span className="comparison-icon">-</span><div><small>WITHOUT PROJECT MEMORY</small><h3>Generic starting point</h3></div></div>
+                  <p>A fresh agent would use broad authentication patterns and still need to decide where refresh tokens belong.</p>
+                  <div className="generic-lines"><span>Choose a token storage approach</span><span>Check existing security conventions</span><span>Validate assumptions with the team</span></div>
+                </article>
+                <article className="with-context">
+                  <div className="comparison-card-head"><span className="comparison-icon">+</span><div><small>WITH HINDSIGHT PROJECT MEMORY</small><h3>{workspaceMemories === null ? "Retrieve task-specific context" : workspaceMemories.length ? "Ready with project decisions" : "No matching memory found"}</h3></div></div>
+                  {workspaceMemories?.length ? (
+                    <div className="recalled-stack">
+                      {workspaceMemories.map((memory) => (
+                        <div className="recalled-card" key={memory.id}>
+                          <div><span className="type-pill">{kindLabel(memory.type)}</span><small>{memory.origin === "hindsight" ? "Hindsight evidence" : "Demo evidence"}</small></div>
+                          <p>{memory.text}</p>
+                          <footer>{memory.source_agent || memory.metadata.source_agent || "Project memory"} · {timeLabel(memory.timestamp)}</footer>
+                        </div>
+                      ))}
+                    </div>
+                  ) : workspaceMemories ? (
+                    <p className="empty-context">No retained project decision matched this task. Retain a durable decision or make the task more specific.</p>
+                  ) : (
+                    <p className="empty-context">Run a retrieval to see the exact Hindsight evidence this agent should receive before coding.</p>
+                  )}
+                </article>
+              </div>
+              <p className="workspace-trust">ProjectPulse prepares context and records the recall. A real Codex, Claude Code, or Copilot client receives it through MCP after you connect it in MCP setup.</p>
             </section>
           )}
 
@@ -571,6 +698,8 @@ export default function App() {
               </div>
             </section>
           )}
+            </div>
+          </div>
         </>
       )}
 
@@ -592,7 +721,8 @@ export default function App() {
         memory={selectedMemory}
         close={() => setSelectedMemory(null)}
       />}
-    </main>
+      </main>
+    </>
   );
 }
 

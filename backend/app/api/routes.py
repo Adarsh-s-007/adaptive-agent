@@ -223,13 +223,13 @@ async def recall(project_id: str, body: RecallRequest, db: DBSession):
         project_id,
         body.task,
         body.limit,
-        source_agent="Dashboard recall",
+        source_agent=body.agent_name,
         tool_name="dashboard.recall",
     )
     event = db.get(MemoryEvent, result["event_id"])
     return {
         "memories": result["memories"],
-        "event": event_dto(event, "Dashboard recall"),
+        "event": event_dto(event, body.agent_name),
         "used_bank_id": result["used_bank_id"],
         "origin": result["origin"],
     }
