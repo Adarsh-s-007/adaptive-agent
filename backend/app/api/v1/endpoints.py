@@ -34,10 +34,13 @@ from app.services.compare_service import CompareService
 from app.services.extraction_validator import ExtractionValidator
 from app.services.generation_service import GenerationService
 from app.services.governed_memory_service import GovernedMemoryService
+from app.services.metrics_service import MetricsService
 from app.services.project_memory_service import project_or_404
 from app.services.project_service import ProjectService
 from app.services.review_service import ReviewService
+from app.services.seed_service import SeedService
 from app.services.signals import TranscriptPreparer
+from app.services.timeline_service import TimelineService
 from app.services.transcript_parser import TranscriptParser
 
 router = APIRouter(dependencies=[Depends(verify_bearer_token)])
@@ -53,6 +56,9 @@ check_service = CheckService(hindsight_gw, llm_gw, mem_service)
 gen_service = GenerationService(llm_gw, brief_service)
 compare_service = CompareService(gen_service, check_service)
 review_service = ReviewService(mem_service)
+timeline_service = TimelineService()
+metrics_service = MetricsService(hindsight_gw)
+seed_service = SeedService(mem_service)
 
 
 # --- Request Models ---
@@ -440,4 +446,196 @@ def toggle_hindsight_offline(body: OfflineToggleRequest):
     """Set HINDSIGHT_FORCE_OFFLINE toggle for degradation testing (HS-6)."""
     hindsight_gw.set_force_offline(body.force_offline)
     return {"force_offline": hindsight_gw.is_forced_offline}
+
+
+# --- Governed Records, Timeline, Metrics & Seed Endpoints (P3 / RC-1..7, MT-1) ---
+
+class CreateRecordRequest(BaseModel):
+    title: str = Field(..., min_length=3, max_length=255)
+    statement: str = Field(..., min_length=10)
+    memory_type: str = Field(default="architecture_decision")
+    rationale: str | None = None
+    area: str | None = None
+    importance: int = Field(default=3, ge=1, le=5)
+    tags: list[str] = Field(default_factory=list)
+    check_patterns: list[str] = Field(default_factory=list)
+    evidence_quote: str | None = None
+
+
+class SupersedeRecordRequest(BaseModel):
+    title: str = Field(..., min_length=3, max_length=255)
+    statement: str = Field(..., min_length=10)
+    rationale: str | None = None
+    area: str | None = None
+    importance: int = Field(default=3, ge=1, le=5)
+    evidence_quote: str | None = None
+
+
+class RetractRecordRequest(BaseModel):
+    reason: str | None = None
+
+
+class SeedRequest(BaseModel):
+    dataset: str = Field(default="apexcart")  # apexcart, ledgerlite
+
+
+@router.get("/projects/{pid}/records")
+def list_governed_records(
+    pid: str,
+    db: DBSession,
+    status: str | None = None,
+    memory_type: str | None = None,
+    area: str | None = None,
+):
+    """List governed records for this project with optional status and area filters (RC-1)."""
+    project_or_404(db, pid)
+    query = select(MemoryRecord).where(MemoryRecord.project_id == pid)
+    if status:
+        query = query.where(MemoryRecord.status == status)
+    if memory_type:
+        query = query.where(MemoryRecord.type == memory_type)
+    if area:
+        query = query.where(MemoryRecord.area == area)
+    records = db.scalars(query.order_by(MemoryRecord.importance.desc(), MemoryRecord.decided_at.desc())).all()
+    return [
+        {
+            "id": r.id,
+            "pill": r.pill,
+            "project_id": r.project_id,
+            "type": r.type,
+            "title": r.title,
+            "statement": r.statement,
+            "rationale": r.rationale,
+            "area": r.area,
+            "importance": r.importance,
+            "status": r.status,
+            "confidence_band": r.confidence_band,
+            "supersedes_id": r.supersedes_id,
+            "superseded_by_id": r.superseded_by_id,
+            "hindsight_document_id": r.hindsight_document_id,
+            "retain_state": r.retain_state,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in records
+    ]
+
+
+@router.get("/projects/{pid}/records/{rid}")
+def get_governed_record(pid: str, rid: str, db: DBSession):
+    """Fetch complete governed record details including evidence and lineage (RC-1)."""
+    project_or_404(db, pid)
+    rec = db.get(MemoryRecord, rid)
+    if not rec or rec.project_id != pid:
+        raise AppError(code=AppErrorCode.NOT_FOUND, message="Record not found", status_code=404)
+    evidence = [
+        {"id": ev.id, "quote": ev.quote, "speaker": ev.speaker, "turn_index": ev.turn_index}
+        for ev in rec.evidence
+    ]
+    return {
+        "id": rec.id,
+        "pill": rec.pill,
+        "project_id": rec.project_id,
+        "type": rec.type,
+        "title": rec.title,
+        "statement": rec.statement,
+        "rationale": rec.rationale,
+        "area": rec.area,
+        "importance": rec.importance,
+        "status": rec.status,
+        "confidence_band": rec.confidence_band,
+        "supersedes_id": rec.supersedes_id,
+        "superseded_by_id": rec.superseded_by_id,
+        "hindsight_document_id": rec.hindsight_document_id,
+        "retain_state": rec.retain_state,
+        "tags": json.loads(rec.tags_json or "[]"),
+        "check_patterns": json.loads(rec.check_patterns_json or "[]"),
+        "evidence": evidence,
+        "created_at": rec.created_at.isoformat(),
+        "updated_at": rec.updated_at.isoformat(),
+    }
+
+
+@router.post("/projects/{pid}/records", status_code=201)
+async def create_governed_record(pid: str, body: CreateRecordRequest, db: DBSession):
+    """Create and retain a new governed memory record (RC-1)."""
+    project_or_404(db, pid)
+    rec = await mem_service.create_record(
+        db=db,
+        project_id=pid,
+        title=body.title,
+        statement=body.statement,
+        memory_type=body.memory_type,
+        rationale=body.rationale,
+        area=body.area,
+        importance=body.importance,
+        tags=body.tags,
+        check_patterns=body.check_patterns,
+        evidence_quote=body.evidence_quote,
+    )
+    return {
+        "id": rec.id,
+        "pill": rec.pill,
+        "status": rec.status,
+        "retain_state": rec.retain_state,
+        "title": rec.title,
+    }
+
+
+@router.post("/projects/{pid}/records/{rid}/supersede")
+async def supersede_governed_record(pid: str, rid: str, body: SupersedeRecordRequest, db: DBSession):
+    """Execute 5-step supersession protocol (RC-2, RC-3)."""
+    project_or_404(db, pid)
+    new_rec = await mem_service.supersede(
+        db=db,
+        old_record_id=rid,
+        title=body.title,
+        statement=body.statement,
+        rationale=body.rationale,
+        area=body.area,
+        importance=body.importance,
+        evidence_quote=body.evidence_quote,
+    )
+    return {
+        "status": "superseded",
+        "old_record_id": rid,
+        "new_record_id": new_rec.id,
+        "new_pill": new_rec.pill,
+    }
+
+
+@router.post("/projects/{pid}/records/{rid}/retract")
+async def retract_governed_record(pid: str, rid: str, body: RetractRecordRequest, db: DBSession):
+    """Retract an obsolete or erroneous record (RC-4)."""
+    project_or_404(db, pid)
+    rec = await mem_service.retract(db=db, record_id=rid, reason=body.reason)
+    return {"status": "retracted", "record_id": rec.id, "pill": rec.pill}
+
+
+@router.get("/projects/{pid}/timeline")
+def get_project_timeline(pid: str, db: DBSession, limit: int = 50):
+    """Fetch unified chronological timeline of records, sessions, and audits (MT-1)."""
+    project_or_404(db, pid)
+    return timeline_service.get_timeline(db, pid, limit=limit)
+
+
+@router.get("/projects/{pid}/metrics")
+async def get_project_metrics(pid: str, db: DBSession):
+    """Fetch authoritative §20 governance metrics, distributions, and compliance score (MT-1)."""
+    project_or_404(db, pid)
+    return await metrics_service.get_project_metrics(db, pid)
+
+
+@router.post("/projects/{pid}/seed")
+async def seed_project_data(pid: str, body: SeedRequest, db: DBSession):
+    """Seed authentic ApexCart or LedgerLite enterprise memories into project (RC-6, RC-7)."""
+    project_or_404(db, pid)
+    return await seed_service.seed_dataset(db, pid, dataset=body.dataset)
+
+
+@router.post("/projects/{pid}/outbox/flush")
+async def flush_project_outbox(pid: str, db: DBSession):
+    """Flush pending offline outbox messages to Hindsight Cloud (RC-5)."""
+    project_or_404(db, pid)
+    return await mem_service.flush_outbox(db, pid)
+
 

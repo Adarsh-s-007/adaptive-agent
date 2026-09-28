@@ -179,3 +179,21 @@ class ComparisonRun(Base):
     injected_tokens: Mapped[int] = mapped_column(Integer, default=0)
     fairness_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class OutboxMessage(Base):
+    """Reliable outbox queue for Hindsight memory synchronization (RC-5)."""
+
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuidv7)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
+    record_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    operation: Mapped[str] = mapped_column(String(30), nullable=False)  # retain, retag, delete
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)  # pending, sent, failed
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+

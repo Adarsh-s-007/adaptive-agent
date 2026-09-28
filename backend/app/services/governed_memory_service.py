@@ -132,6 +132,24 @@ class GovernedMemoryService:
         except Exception as exc:
             record.retain_state = "failed"
             record.last_error = str(exc)
+            # Enqueue to Outbox table for recovery sync (RC-5)
+            from app.db.governed_models import OutboxMessage
+            db.add(
+                OutboxMessage(
+                    project_id=project_id,
+                    record_id=record_id,
+                    operation="retain",
+                    payload_json=json.dumps({
+                        "content": rendered_content,
+                        "type": memory_type,
+                        "area": area,
+                        "importance": importance,
+                        "tags": tags or [],
+                    }),
+                    status="pending",
+                    last_error=str(exc),
+                )
+            )
 
         db.commit()
         db.refresh(record)
@@ -246,3 +264,54 @@ class GovernedMemoryService:
         )
         await self.gateway.retag_document(ctx, record.id, retracted_tags)
         return record
+
+    async def flush_outbox(self, db: Session, project_id: str) -> dict[str, Any]:
+        """Process pending outbox messages and sync to Hindsight Cloud (RC-5)."""
+        from app.db.governed_models import OutboxMessage
+
+        ctx = BankResolver.resolve(db, project_id)
+        pending = list(
+            db.scalars(
+                select(OutboxMessage)
+                .where(OutboxMessage.project_id == project_id, OutboxMessage.status == "pending")
+                .order_by(OutboxMessage.created_at.asc())
+            ).all()
+        )
+
+        synced = 0
+        failed = 0
+        for msg in pending:
+            try:
+                payload = json.loads(msg.payload_json)
+                if msg.operation == "retain":
+                    await self.gateway.retain_record(
+                        ctx=ctx,
+                        record_id=msg.record_id,
+                        content=payload["content"],
+                        memory_type=payload["type"],
+                        area=payload.get("area"),
+                        importance=payload.get("importance", 3),
+                        tags=payload.get("tags"),
+                    )
+                    rec = db.get(MemoryRecord, msg.record_id)
+                    if rec:
+                        rec.retain_state = "retained"
+                elif msg.operation == "retag":
+                    ok = await self.gateway.retag_document(ctx, msg.record_id, payload["tags"])
+                    if not ok:
+                        raise AppError(code=AppErrorCode.HINDSIGHT_UNAVAILABLE, message="Retag failed", status_code=502)
+                msg.status = "sent"
+                synced += 1
+            except Exception as exc:
+                msg.retry_count += 1
+                msg.last_error = str(exc)
+                failed += 1
+
+        db.commit()
+        return {
+            "project_id": project_id,
+            "messages_processed": len(pending),
+            "synced": synced,
+            "failed": failed,
+        }
+

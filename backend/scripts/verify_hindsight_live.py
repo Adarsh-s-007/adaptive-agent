@@ -184,6 +184,9 @@ async def run_live_verification():
     assert retag_ok, "Retagging failed"
     print("    -> PASS: Document tag updated to status:superseded via PATCH.")
 
+    # Allow cloud index to update
+    await asyncio.sleep(2.0)
+
     # 6. Recall with tag filter (exclude superseded)
     print("\n[7] Recalling memory with exclude_status=['superseded']...")
     recalled_filtered = await gateway.recall(

@@ -219,16 +219,21 @@ class HindsightGateway:
             doc_id = item.get("document_id") or ""
             rec_id = meta.get("record_id") or (doc_id.replace("mem_", "") if doc_id else "")
 
-            # Extract status from metadata or tags (format: status:<status>)
-            status = meta.get("status")
-            if not status:
-                for t in item_tags:
-                    if t.startswith("status:"):
-                        status = t.split(":", 1)[1]
-                        break
-            status = status or "active"
+            # Extract all status indicators from metadata and tags
+            record_statuses = set()
+            if meta.get("status"):
+                record_statuses.add(str(meta["status"]).lower())
+            for t in item_tags:
+                t_lower = t.lower()
+                if t_lower.startswith("status:"):
+                    record_statuses.add(t_lower.split(":", 1)[1])
+                elif t_lower in ("superseded", "retracted", "deprecated", "active"):
+                    record_statuses.add(t_lower)
 
-            if exclude_status and status in exclude_status:
+            if not record_statuses:
+                record_statuses.add("active")
+
+            if exclude_status and any(st.lower() in record_statuses for st in exclude_status):
                 continue
 
             facts.append(
