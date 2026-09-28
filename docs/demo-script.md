@@ -1,4 +1,4 @@
-﻿# ProjectPulse 90-second MCP-first demo
+# ProjectPulse 90-second MCP-first demo
 
 Before judges arrive, start the API and frontend, open `http://localhost:5176`, and keep **Agent activity** ready. If no Hindsight key is configured, say clearly that the demonstration uses **Demo mode - local sample memory**. The MCP tool call remains real; only its memory backend is local.
 

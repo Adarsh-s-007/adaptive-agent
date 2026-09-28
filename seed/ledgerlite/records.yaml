@@ -1,0 +1,34 @@
+# Owner: P3. LedgerLite records (blueprint 25.3). Each one contradicts an ApexCart rule.
+- seed_key: B01
+  type: security_constraint
+  area: auth
+  decided_at: "2026-05-02"
+  importance: 3
+  title: Session storage for access tokens
+  statement: Short-lived (15 min) access tokens may be kept in sessionStorage; no refresh tokens; SSO via the company identity provider.
+  rationale: Internal tool behind VPN.
+  applies_to: [login, session, token storage]
+- seed_key: B02
+  type: api_contract
+  area: api
+  decided_at: "2026-05-10"
+  importance: 2
+  title: RFC 7807 errors
+  statement: Errors use RFC 7807 application/problem+json responses from every endpoint.
+  applies_to: [endpoint, error response]
+- seed_key: B03
+  type: decision
+  area: database
+  decided_at: "2026-05-18"
+  importance: 2
+  title: Money as NUMERIC
+  statement: Money is NUMERIC(12,2) via SQLAlchemy Decimal in every ledger table.
+  applies_to: [money, amounts, ledger]
+- seed_key: B04
+  type: preference
+  area: testing
+  decided_at: "2026-06-01"
+  importance: 1
+  title: pytest with factory-boy
+  statement: Tests use pytest with factory-boy fixtures for every model.
+  applies_to: [tests, fixtures]

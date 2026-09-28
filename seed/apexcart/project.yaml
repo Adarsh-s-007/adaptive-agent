@@ -1,0 +1,8 @@
+# Owner: P3. Synthetic demo project (blueprint section 25).
+name: ApexCart
+description: >-
+  Next.js 14 App Router storefront with TypeScript route handlers under app/api,
+  Prisma on Supabase PostgreSQL behind PgBouncer, Stripe payments, Upstash Redis for
+  rate limiting, deployed on Vercel.
+tech_stack: [Next.js 14, TypeScript, Prisma, PostgreSQL, Stripe, Upstash Redis, Vercel]
+areas: [auth, api, database, payments, checkout, frontend, infra, testing, observability]

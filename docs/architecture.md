@@ -1,36 +1,33 @@
-﻿# ProjectPulse MCP-first architecture
+# ProjectPulse architecture
 
-```text
-Coding agent (Claude Code / Copilot / MCP CLI)
-  -> MCP stdio server: three focused tools
-  -> project_memory_service
-      -> project_id lookup in PostgreSQL/Supabase
-      -> Hindsight Cloud bank for that project (real mode)
-      -> demo_memories table for that project (explicit demo mode)
-      -> audit_event_service -> sessions, memory_events, agent_activity
-  -> coding agent continues with only retrieved facts
+## Layers
 
-React dashboard -> FastAPI -> same project_memory_service + audit database
-```
+| Layer | Location | Rule |
+|---|---|---|
+| Routers | `backend/app/api/*.py` | Validate and delegate. Paths are relative to `/api/v1`, and every route needs the bearer token except `/health`. |
+| Services | `backend/app/services/*.py` | Business logic for one stage of the loop. Raise `AppError`, never `HTTPException`. |
+| Gateways | `backend/app/gateways/` | The only code that talks to Hindsight or Groq. Take a `ProjectContext`, never a raw bank id. |
+| Core | `backend/app/core/` | Config, errors, security, ids, tokens, audit, memory conventions. |
+| DB | `backend/app/db/models.py`, `alembic/` | Ten tables (blueprint §14). Only P1 changes them. |
 
-The MCP stdio entry point is `projectpulse-mcp/server.py`. The registered tools live in `backend/app/services/mcp_server.py` so the local in-memory MCP demo and the separate stdio process use identical tool definitions. The API never handles raw MCP transport messages.
+## Memory loop
 
-## Project isolation
+Capture → Extract → Review → Retain → Brief → Generate → Check, with Reflect feeding the Rulebook and Ask.
 
-`projects.hindsight_bank_id` is the only bank chosen for a given project UUID. In real mode, retain and recall include the immutable `project:{uuid}` tag; recall uses a strict tag match in that bank. List uses the same bank and project tag. A caller cannot supply a bank ID or override the project tag. Session IDs are checked against the selected project. Demo mode uses a separate, clearly prefixed bank mapping and queries `demo_memories` by project ID; it never calls Hindsight.
+1. **Retain** (P3 `memory_service.create_record`): the record is saved as `pending` and committed, then retained to Hindsight, then marked `retained` or `failed`. The transaction is never held across the provider call.
+2. **Supersede** (P3): the new record is retained with a "Replaces the decision of …" line. The old record is retagged `status:superseded` and marked superseded in PostgreSQL. If the retag fails, the old record becomes `retag_pending`, and Brief still excludes it because it post-filters by PostgreSQL status.
+3. **Brief** (P5 `brief_service.build_brief`): skipped when there are no active records. Otherwise: recall → group facts by `record_id` → keep active records only → applicability filter (≤5 applied, each with a reason) → injected token count. If the filter fails, the top 3 are used and labelled `unfiltered`. If Hindsight is down, the result is `memory_unavailable`.
+4. **Run** (P5 `generation_service.run`): baseline and memory runs use identical prompts except for the `<project_memory>` block. Baseline runs make no Hindsight calls.
 
-Real Hindsight memory is not reconstructed from `memory_events`. That table is an audit trail, while Hindsight owns the long-term searchable memory. The local demo table is used only for projects explicitly created without credentials and is not presented as Hindsight.
+## Hindsight document conventions
 
-## Call flow
+Defined once in `app/core/memory_conventions.py`:
 
-1. A new project creates a Hindsight bank if a key is configured; otherwise it receives a `demo-` bank mapping.
-2. `retain_project_memory` validates type, tags, source/session, and obvious credential patterns. It sends the fact to Hindsight Retain or local demo storage, then writes a retained event and activity audit.
-3. `recall_project_memory` validates the project, retrieves only task-relevant facts, creates a fresh agent session, and writes task/tool/evidence audit entries. It returns memory ID, content, type, tags, source/session, timestamp, and origin.
-4. `list_project_memories` reads Hindsight's bank-scoped memory-unit list endpoint or the local demo table, with optional type/tag filters.
-5. The dashboard reads the memory list, timeline, and activity. Its judge-facing button uses the official MCP Client against the same registered server object; `demo_cli.py` proves the separate stdio transport too.
+- `document_id = "mem_<record_uuid>"`
+- tags `type:<type>`, `area:<area>`, `status:<status>`, and `confidence:low` when applicable
+- metadata values are strings (absent values are empty strings): record_id, project_id, type, area, importance, source_session_id, supersedes, stated_by
+- timestamp = `decided_at`
 
-The local sample code result after the demo recall is deterministic and labelled. It is not an external agent output. The old Groq comparison route remains available but is not part of the MCP-first path.
+## Isolation
 
-## Security and limits
-
-Secrets stay in backend environment variables. The frontend receives no provider key. MCP tools require a project UUID and cannot choose arbitrary banks. The API is unauthenticated for the hackathon and must be protected before public deployment. The list endpoint currently shows up to 100 recent memory units; add pagination for larger projects. SQLAlchemy creates tables at startup, but production deployments should add migrations.
+One bank per project, resolved server-side by `gateways/project_context.resolve()`. No endpoint accepts a bank id (tested in `tests/unit/platform`).

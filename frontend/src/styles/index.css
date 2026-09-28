@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+/* Owner: P1. Memory-type colours are fixed everywhere (blueprint section 9). */
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-ink: #17201c;
+  --color-muted: #5a6661;
+  --color-rule: #dde3df;
+  --color-paper: #f6f7f5;
+  --color-accent: #1d5e4b;
+  --color-t-decision: #2f5fa7;
+  --color-t-security_constraint: #b3203a;
+  --color-t-convention: #6a4b9e;
+  --color-t-api_contract: #1f7a6d;
+  --color-t-incident: #b4531f;
+  --color-t-failed_approach: #8a5a00;
+  --color-t-deployment: #4f5a63;
+  --color-t-preference: #7a6a2b;
+}
+
+body {
+  @apply bg-paper text-ink font-sans antialiased;
+}
