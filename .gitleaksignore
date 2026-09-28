@@ -1,0 +1,3 @@
+# Fake Stripe key used by the secret-rejection test in commit 4f1e893 (not a real credential).
+# The test now builds the value at runtime; this entry only covers the historical commit.
+4f1e8931f1d5ec2d74b03f13508ef8e6971092fd:backend/tests/test_governed_memory.py:stripe-access-token:444

@@ -438,15 +438,18 @@ def test_s1_instruction_like_candidate_needs_edit(env):
 
 
 def test_s2_secret_is_rejected(env):
+    # Fake credentials are assembled at runtime so secret scanners (gitleaks) never see a literal.
+    fake_stripe = "sk_" + "live_" + "abcdefghijklmnop1234"
+    fake_hindsight = "hsk_" + "abcdefghijklmnop_123"
     p = make_project(env)
     r = env.client.post(
         f"/api/v1/projects/{p['id']}/memories",
-        json={"title": "Key", "statement": "Use the Stripe key sk_live_abcdefghijklmnop1234 in production.", "type": "deployment"},
+        json={"title": "Key", "statement": f"Use the Stripe key {fake_stripe} in production.", "type": "deployment"},
     )
     assert r.status_code == 422
     v = ExtractionValidator.validate(
-        statement="The API key is hsk_abcdefghijklmnop_123 for prod.", memory_type="deployment",
-        evidence_quote="The API key is", transcript_texts=["The API key is hsk_abcdefghijklmnop_123 for prod."],
+        statement=f"The API key is {fake_hindsight} for prod.", memory_type="deployment",
+        evidence_quote="The API key is", transcript_texts=[f"The API key is {fake_hindsight} for prod."],
     )
     assert not v.valid
 
