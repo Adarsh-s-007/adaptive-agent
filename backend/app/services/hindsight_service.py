@@ -31,12 +31,20 @@ class HindsightService:
         return f"{self.settings.hindsight_base_url.rstrip('/')}/v1/default{path}"
 
     async def _request(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        params: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         try:
             async with httpx.AsyncClient(timeout=45) as client:
                 response = await client.request(
-                    method, self._url(path), headers=self._headers(), json=payload
+                    method,
+                    self._url(path),
+                    headers=self._headers(),
+                    json=payload,
+                    params=params,
                 )
                 response.raise_for_status()
                 return response.json() if response.content else {}
@@ -128,6 +136,37 @@ class HindsightService:
         chunks = data.get("chunks") or {}
         return [self._normalise(item, chunks) for item in raw[:limit]]
 
+    async def list_memories(
+        self,
+        bank_id: str,
+        project_id: str,
+        memory_type: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read provider memory units, never a local substitute."""
+        params = [
+            ("tags", f"project:{project_id}"),
+            ("tags_match", "all_strict"),
+            ("limit", "100"),
+            ("offset", "0"),
+        ]
+        if tag:
+            params.append(("tags", tag))
+        data = await self._request(
+            "GET", f"/banks/{quote(bank_id, safe='')}/memories/list", params=params
+        )
+        raw = data.get("items", [])
+        if not isinstance(raw, list):
+            raise HTTPException(502, "Hindsight returned an unexpected memory list.")
+        items = [self._normalise(item, {}) for item in raw]
+        if memory_type:
+            items = [
+                item
+                for item in items
+                if item["metadata"].get("memory_type") == memory_type
+            ]
+        return items
+
     @staticmethod
     def _normalise(item: Any, chunks: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or not item.get("id") or not item.get("text"):
@@ -137,10 +176,18 @@ class HindsightService:
         return {
             "id": item["id"],
             "text": item["text"],
-            "type": item.get("type") or "memory",
+            "type": (item.get("metadata") or {}).get("memory_type")
+            or item.get("type")
+            or "memory",
+            "tags": item.get("tags") or [],
+            "origin": "hindsight",
+            "source_agent": (item.get("metadata") or {}).get("source_agent"),
+            "session_id": (item.get("metadata") or {}).get("session_id"),
             "metadata": item.get("metadata") or {},
             "document_id": item.get("document_id"),
-            "timestamp": item.get("mentioned_at") or item.get("occurred_start"),
+            "timestamp": item.get("mentioned_at")
+            or item.get("occurred_start")
+            or item.get("date"),
             "source_text": chunk.get("text") if isinstance(chunk, dict) else None,
             "relevance": scores.get("final"),
             "why_relevant": None,

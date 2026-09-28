@@ -1,123 +1,123 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import App from "./App";
-import type { Event, Project } from "./api";
+import type { Activity, Event, Memory, Project } from "./api";
 
 const project: Project = {
   id: "11111111-1111-4111-8111-111111111111",
   name: "E-commerce Platform",
   description: "Storefront demo",
-  hindsight_bank_id: "projectpulse-e-commerce-platform-11111111",
+  hindsight_bank_id: "demo-projectpulse-e-commerce-platform-11111111",
+  memory_mode: "demo",
   created_at: "2026-09-28T10:00:00Z",
+};
+const jwt: Memory = {
+  id: "jwt-fact",
+  text: "JWT refresh tokens must use HTTP-only, Secure cookies. LocalStorage is forbidden.",
+  type: "security_rule",
+  tags: ["project:" + project.id, "authentication", "security"],
+  metadata: { memory_type: "security_rule", source_agent: "Agent A - previous session" },
+  source_agent: "Agent A - previous session",
+  session_id: "agent-a-session",
+  timestamp: "2026-09-28T10:00:00Z",
+  origin: "demo",
 };
 
 function response(body: unknown, status = 200): Response {
-  return {
-    ok: status < 400,
-    status,
-    json: async () => body,
-  } as Response;
+  return { ok: status < 400, status, json: async () => body } as Response;
 }
 
-describe("ProjectPulse dashboard demo", () => {
+describe("ProjectPulse MCP dashboard", () => {
   let projects: Project[];
   let events: Event[];
-  let retained: number;
-  let recalled: number;
+  let memories: Memory[];
+  let activities: Activity[];
   let calls: Array<{ path: string; method: string; body: unknown }>;
 
   beforeEach(() => {
     projects = [];
     events = [];
-    retained = 0;
-    recalled = 0;
+    memories = [];
+    activities = [];
     calls = [];
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string, options?: RequestInit) => {
-        const path = new URL(input).pathname;
-        const method = options?.method || "GET";
-        const body = options?.body ? JSON.parse(String(options.body)) : null;
-        calls.push({ path, method, body });
+    vi.stubGlobal("fetch", vi.fn(async (input: string, options?: RequestInit) => {
+      const path = new URL(input).pathname;
+      const method = options?.method || "GET";
+      const body = options?.body ? JSON.parse(String(options.body)) : null;
+      calls.push({ path, method, body });
 
-        if (path === "/health") {
-          return response({ status: "ok", hindsight_configured: true, groq_configured: true });
-        }
-        if (path === "/projects" && method === "GET") return response(projects);
-        if (path === "/projects" && method === "POST") {
-          projects = [{ ...project, description: body.description }];
-          return response(projects[0], 201);
-        }
-        if (path.endsWith("/seed-demo-data")) {
-          retained = 8;
-          events = [{
-            id: "seed-event",
-            event_type: "retained",
-            source_text:
-              "Memory type: architecture decision\nSource agent: Agent A - previous session\nProject: E-commerce Platform\nDecision / learning: JWT refresh tokens use HTTP-only cookies.",
-            created_at: "2026-09-28T10:00:00Z",
-            session_id: "agent-a-session",
-            agent_name: "Agent A - previous session",
-          }];
-          return response({ seeded: 8 });
-        }
-        if (path.endsWith("/timeline")) return response(events);
-        if (path.endsWith("/stats")) {
-          return response({ retained, recalled, decisions: retained ? 1 : 0, bug_fixes: 0 });
-        }
-        if (path.endsWith("/memories")) {
-          retained += 1;
-          const event: Event = {
-            id: "manual-event",
-            event_type: "retained",
-            source_text:
-              "Memory type: " + body.memory_type +
-              "\nSource agent: " + body.source_agent +
-              "\nProject: E-commerce Platform\nDecision / learning: " + body.content,
-            created_at: "2026-09-28T10:04:00Z",
-            session_id: "agent-a-session",
-            agent_name: body.source_agent,
-          };
-          events = [event, ...events];
-          return response({ event }, 201);
-        }
-        if (path.endsWith("/agent-answer")) {
-          recalled += 1;
-          events = [{
-            id: "recall-event",
-            event_type: "recalled",
-            source_text: body.task,
-            created_at: "2026-09-28T10:05:00Z",
-            session_id: "agent-b-session",
-            agent_name: body.agent_name,
-          }, ...events];
-          return response({
-            generic_answer: "Build a login form and handle errors.",
-            memory_aware_answer:
-              "Use HTTP-only cookies for JWT refresh tokens and avoid localStorage.",
-            memories: [{
-              id: "jwt-fact",
-              text: "JWT refresh tokens must use HTTP-only cookies; avoid localStorage.",
-              type: "world",
-              metadata: {
-                memory_type: "architecture decision",
-                source_agent: "Agent A - previous session",
-              },
-              timestamp: "2026-09-28T10:00:00Z",
-              source_text: "Agent A retained the JWT cookie rule.",
-              why_relevant: "Authentication uses the project's refresh-token rule.",
-            }],
-            used_bank_id: project.hindsight_bank_id,
-            session: { id: "agent-b-session", agent_name: body.agent_name },
-            event: events[0],
-          });
-        }
-        return response({ detail: "Not found" }, 404);
-      })
-    );
+      if (path === "/health") return response({
+        status: "ok", hindsight_configured: false, groq_configured: false,
+      });
+      if (path === "/projects" && method === "GET") return response(projects);
+      if (path === "/projects" && method === "POST") {
+        projects = [project];
+        return response(project, 201);
+      }
+      if (path.endsWith("/seed-demo-data")) {
+        memories = [jwt];
+        events = [{
+          id: "seed-event",
+          event_type: "retained",
+          source_text: "Memory type: security_rule\nSource agent: Agent A - previous session\nDecision / learning: " + jwt.text,
+          created_at: "2026-09-28T10:00:00Z",
+          session_id: "agent-a-session",
+          agent_name: "Agent A - previous session",
+        }];
+        return response({ seeded: 8, mode_label: "Demo mode - local sample memory" });
+      }
+      if (path.endsWith("/timeline")) return response(events);
+      if (path.endsWith("/stats")) return response({
+        retained: memories.length, recalled: activities.some((item) => item.kind === "recall_evidence") ? 1 : 0,
+        decisions: 0, bug_fixes: 0,
+      });
+      if (path.endsWith("/activity")) return response(activities);
+      if (path.endsWith("/memories") && method === "GET") return response({
+        memories, count: memories.length, origin: "demo",
+        mode_label: "Demo mode - local sample memory", used_bank_id: project.hindsight_bank_id,
+      });
+      if (path.endsWith("/memories") && method === "POST") {
+        memories = [{ ...jwt, id: "manual-memory", text: body.content }, ...memories];
+        return response({ event: events[0], memory: memories[0], origin: "demo" }, 201);
+      }
+      if (path.endsWith("/run-mcp-demo")) {
+        activities = [
+          { id: "result", kind: "agent_result", tool_name: null,
+            summary: "Local sample result: use HttpOnly, Secure cookies. Do not use LocalStorage.",
+            evidence: [jwt], origin: "demo", session_id: "agent-b", agent_name: "Fresh Agent B",
+            created_at: "2026-09-28T10:05:03Z" },
+          { id: "recall", kind: "recall_evidence", tool_name: null,
+            summary: "Recalled 1 relevant project memories", evidence: [jwt],
+            origin: "demo", session_id: "agent-b", agent_name: "Fresh Agent B",
+            created_at: "2026-09-28T10:05:02Z" },
+          { id: "tool", kind: "tool_call", tool_name: "projectpulse.recall_project_memory",
+            summary: "Implement login and refresh-token flow for this project.",
+            evidence: [jwt], origin: "demo", session_id: "agent-b", agent_name: "Fresh Agent B",
+            created_at: "2026-09-28T10:05:01Z" },
+          { id: "session", kind: "session_started", tool_name: null,
+            summary: "Fresh Agent B session started", evidence: [], origin: "demo",
+            session_id: "agent-b", agent_name: "Fresh Agent B",
+            created_at: "2026-09-28T10:05:00Z" },
+        ];
+        events = [{ id: "recall-event", event_type: "recalled",
+          source_text: "Implement login and refresh-token flow for this project.",
+          created_at: "2026-09-28T10:05:02Z", session_id: "agent-b",
+          agent_name: "Fresh Agent B" }, ...events];
+        return response({
+          tool_call: "projectpulse.recall_project_memory",
+          task: "Implement login and refresh-token flow for this project.",
+          memories: [jwt],
+          sample_result: activities[0].summary,
+          session_id: "agent-b",
+          origin: "demo",
+          mode_label: "Demo mode - local sample memory",
+        });
+      }
+      return response({ detail: "Not found" }, 404);
+    }));
   });
 
   afterEach(() => {
@@ -125,33 +125,31 @@ describe("ProjectPulse dashboard demo", () => {
     vi.unstubAllGlobals();
   });
 
-  it("seeds, retains through the form, and shows Agent B's memory evidence", async () => {
+  it("keeps the demo and retain flow, then shows evidence from an actual MCP action", async () => {
     const user = userEvent.setup();
     render(<App />);
+    expect(await screen.findByText("Persistent project memory for coding agents.")).toBeTruthy();
+    await user.click(screen.getAllByRole("button", { name: "Launch E-commerce MCP demo" })[0]);
+    expect(await screen.findByText(/Agent A retained 8 sample engineering memories/)).toBeTruthy();
 
-    expect(await screen.findByText("A memory layer for every engineering agent.")).toBeTruthy();
-    await user.click(screen.getAllByRole("button", { name: "Launch E-commerce demo" })[0]);
-    expect(await screen.findByText(/Agent A retained 8 demo memories/)).toBeTruthy();
-    expect(screen.getByText(project.hindsight_bank_id)).toBeTruthy();
-
-    await user.click(screen.getByRole("button", { name: /Retain learning/ }));
+    await user.click(screen.getByRole("button", { name: "Memory timeline" }));
+    expect(await screen.findByText(jwt.text)).toBeTruthy();
+    await user.click(screen.getAllByRole("button", { name: /Retain memory/ })[0]);
     await user.click(screen.getByRole("button", { name: "Use JWT demo decision" }));
-    await user.click(screen.getByRole("button", { name: "Retain in Hindsight" }));
-    expect(await screen.findByText(/retained a project memory in Hindsight/)).toBeTruthy();
-    expect(calls.some((call) =>
-      call.path.endsWith("/memories") &&
-      call.method === "POST" &&
-      JSON.stringify(call.body).includes("HTTP-only cookies")
-    )).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Retain in Demo mode" }));
+    expect(await screen.findByText(/Memory saved in Demo mode/)).toBeTruthy();
+    expect(calls.some((call) => call.path.endsWith("/memories") &&
+      call.method === "POST" && JSON.stringify(call.body).includes("HTTP-only"))).toBe(true);
 
-    await user.click(screen.getByRole("button", { name: /Ask ProjectPulse/ }));
-    expect(await screen.findByText(/This answer used 1 relevant project memory/)).toBeTruthy();
-    expect(screen.getByText("Build a login form and handle errors.")).toBeTruthy();
-    expect(screen.getByText(/Use HTTP-only cookies for JWT refresh tokens and avoid localStorage/)).toBeTruthy();
-    expect(screen.getByText(/Authentication uses the project's refresh-token rule/)).toBeTruthy();
-    expect(calls.some((call) =>
-      call.path.endsWith("/agent-answer") &&
-      JSON.stringify(call.body).includes("Agent B - fresh session")
-    )).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Agent activity" }));
+    await user.click(screen.getByRole("button", { name: "Run fresh Agent B MCP demo" }));
+    expect(await screen.findByText(/official MCP client called recall_project_memory/)).toBeTruthy();
+    expect(screen.getByText("WHY THIS ANSWER IS PROJECT-AWARE")).toBeTruthy();
+    expect(screen.getByText("projectpulse.recall_project_memory")).toBeTruthy();
+    expect(screen.getAllByText(/use HttpOnly, Secure cookies/)[0]).toBeTruthy();
+    expect(calls.some((call) => call.path.endsWith("/run-mcp-demo") &&
+      call.method === "POST")).toBe(true);
   });
 });
+
+

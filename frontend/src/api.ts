@@ -1,4 +1,4 @@
-export const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+﻿export const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response;
@@ -30,6 +30,7 @@ export type Project = {
   name: string;
   description: string;
   hindsight_bank_id: string;
+  memory_mode: "demo" | "hindsight";
   created_at: string;
 };
 
@@ -59,32 +60,58 @@ export type Memory = {
   id: string;
   text: string;
   type: string;
+  memory_type?: string;
+  tags: string[];
   metadata: Record<string, string>;
+  source_agent?: string | null;
+  session_id?: string | null;
   document_id?: string | null;
   timestamp?: string | null;
   source_text?: string | null;
-  relevance?: number | null;
+  origin: "demo" | "hindsight";
   why_relevant?: string | null;
 };
 
-export type Answer = {
-  generic_answer: string;
-  memory_aware_answer: string;
+export type MemoryList = {
   memories: Memory[];
+  count: number;
+  origin: "demo" | "hindsight";
+  mode_label: string;
   used_bank_id: string;
-  session: { id: string; agent_name: string; created_at: string };
-  event: Event;
+};
+
+export type Activity = {
+  id: string;
+  kind: string;
+  tool_name: string | null;
+  summary: string;
+  evidence: Memory[];
+  origin: "demo" | "hindsight";
+  session_id: string | null;
+  agent_name: string | null;
+  created_at: string;
 };
 
 export type MemoryForm = {
   memory_type:
-    | "architecture decision"
-    | "coding convention"
-    | "bug fix"
-    | "failed approach"
-    | "feature progress";
+    | "architecture_decision"
+    | "security_rule"
+    | "api_contract"
+    | "incident_fix"
+    | "coding_convention";
   source_agent: string;
   content: string;
+  tags: string[];
+};
+
+export type McpDemo = {
+  tool_call: string;
+  task: string;
+  memories: Memory[];
+  sample_result: string;
+  session_id: string;
+  origin: "demo" | "hindsight";
+  mode_label: string;
 };
 
 export const api = {
@@ -94,16 +121,17 @@ export const api = {
     request<Project>("/projects", { method: "POST", body: JSON.stringify(body) }),
   timeline: (id: string) => request<Event[]>(`/projects/${id}/timeline`),
   stats: (id: string) => request<Stats>(`/projects/${id}/stats`),
+  activity: (id: string) => request<Activity[]>(`/projects/${id}/activity`),
+  memories: (id: string) => request<MemoryList>(`/projects/${id}/memories`),
   seed: (id: string) =>
-    request<{ seeded: number }>(`/projects/${id}/seed-demo-data`, { method: "POST" }),
+    request<{ seeded: number; mode_label: string }>(`/projects/${id}/seed-demo-data`, {
+      method: "POST",
+    }),
   retain: (id: string, body: MemoryForm) =>
-    request<{ event: Event }>(`/projects/${id}/memories`, {
+    request<{ event: Event; memory: Memory; origin: string }>(`/projects/${id}/memories`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  ask: (id: string, body: { agent_name: string; task: string }) =>
-    request<Answer>(`/projects/${id}/agent-answer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  runMcpDemo: (id: string) =>
+    request<McpDemo>(`/projects/${id}/run-mcp-demo`, { method: "POST" }),
 };

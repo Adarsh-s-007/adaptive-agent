@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "projectpulse": {
+      "type": "stdio",
+      "command": "backend/.venv/bin/python",
+      "args": ["projectpulse-mcp/server.py"]
+    }
+  }
+}

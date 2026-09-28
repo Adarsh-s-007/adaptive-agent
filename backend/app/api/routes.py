@@ -1,30 +1,41 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
+from mcp import Client
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db.database import get_db
-from app.models.entities import AgentSession, DemoScenario, MemoryEvent, Project
+from app.models.entities import (
+    AgentActivity,
+    AgentSession,
+    DemoScenario,
+    MemoryEvent,
+    Project,
+)
 from app.schemas.requests import (
     AgentAnswerRequest,
     MemoryCreate,
     ProjectCreate,
     RecallRequest,
 )
+from app.services.audit_event_service import AuditEventService
 from app.services.groq_service import GroqService
 from app.services.hindsight_service import HindsightService
+from app.services.mcp_server import mcp
+from app.services.project_memory_service import ProjectMemoryService, demo_mode
 
 DBSession = Annotated[Session, Depends(get_db)]
 
 router = APIRouter()
 hindsight = HindsightService()
 groq = GroqService()
+memory_service = ProjectMemoryService(hindsight)
 
 
 def project_or_404(db: Session, project_id: str) -> Project:
@@ -44,6 +55,7 @@ def project_dto(project: Project) -> dict:
         "name": project.name,
         "description": project.description,
         "hindsight_bank_id": project.hindsight_bank_id,
+        "memory_mode": "demo" if demo_mode(project) else "hindsight",
         "created_at": project.created_at,
     }
 
@@ -81,11 +93,16 @@ async def create_project(body: ProjectCreate, db: DBSession):
         id=project_id,
         name=name,
         description=body.description.strip(),
-        hindsight_bank_id=hindsight.bank_slug(name, project_id),
+        hindsight_bank_id=(
+            hindsight.bank_slug(name, project_id)
+            if get_settings().hindsight_api_key
+            else "demo-" + hindsight.bank_slug(name, project_id)
+        ),
     )
-    await hindsight.create_bank(
-        project.hindsight_bank_id, project.name, project.description
-    )
+    if not demo_mode(project):
+        await hindsight.create_bank(
+            project.hindsight_bank_id, project.name, project.description
+        )
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -169,67 +186,89 @@ def stats(project_id: str, db: DBSession):
     return result
 
 
+@router.get("/projects/{project_id}/memories")
+async def list_memories(
+    project_id: str,
+    db: DBSession,
+    memory_type: str | None = None,
+    tag: str | None = None,
+):
+    return await memory_service.list_memories(db, project_id, memory_type, tag)
+
+
 @router.post("/projects/{project_id}/memories", status_code=201)
 async def retain(project_id: str, body: MemoryCreate, db: DBSession):
-    project = project_or_404(db, project_id)
-    document_id = f"memory-{uuid.uuid4()}"
-    content = retained_content(
-        project, body.memory_type, body.source_agent.strip(), body.content.strip()
+    result = await memory_service.retain(
+        db,
+        project_id,
+        body.content,
+        body.memory_type,
+        body.tags,
+        body.source_agent,
+        tool_name="dashboard.retain_memory",
     )
-    response = await hindsight.retain(
-        project.hindsight_bank_id,
-        content=content,
-        document_id=document_id,
-        metadata={
-            "project_id": project.id,
-            "memory_type": body.memory_type,
-            "source_agent": body.source_agent.strip(),
-        },
-        tags=[f"project:{project.id}", f"type:{body.memory_type.replace(' ', '-')}"],
-    )
-    if response.get("success") is False:
-        raise HTTPException(502, "Hindsight did not confirm the Retain operation.")
-    session = AgentSession(
-        project_id=project.id,
-        agent_name=body.source_agent.strip(),
-        task="Retain project learning",
-    )
-    db.add(session)
-    db.flush()
-    event = MemoryEvent(
-        project_id=project.id,
-        session_id=session.id,
-        event_type="retained",
-        source_text=content,
-        hindsight_memory_reference=json.dumps({"document_id": document_id}),
-    )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
-    return {"event": event_dto(event, session.agent_name), "hindsight": response}
+    event = db.get(MemoryEvent, result["event_id"])
+    return {
+        "event": event_dto(event, body.source_agent),
+        "memory": result["memory"],
+        "origin": result["origin"],
+        "mode_label": result["mode_label"],
+    }
 
 
 @router.post("/projects/{project_id}/recall")
 async def recall(project_id: str, body: RecallRequest, db: DBSession):
-    project = project_or_404(db, project_id)
-    candidates = await hindsight.recall(
-        project.hindsight_bank_id, project.id, body.task.strip(), body.limit
+    result = await memory_service.recall(
+        db,
+        project_id,
+        body.task,
+        body.limit,
+        source_agent="Dashboard recall",
+        tool_name="dashboard.recall",
     )
-    memories = await groq.select_relevant(body.task.strip(), candidates)
-    event = MemoryEvent(
-        project_id=project.id,
-        event_type="recalled",
-        source_text=body.task.strip(),
-        hindsight_memory_reference=reference_ids(memories),
-    )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
+    event = db.get(MemoryEvent, result["event_id"])
     return {
-        "memories": memories,
-        "event": event_dto(event),
-        "used_bank_id": project.hindsight_bank_id,
+        "memories": result["memories"],
+        "event": event_dto(event, "Dashboard recall"),
+        "used_bank_id": result["used_bank_id"],
+        "origin": result["origin"],
     }
+
+
+@router.get("/projects/{project_id}/activity")
+def activity(project_id: str, db: DBSession):
+    project_or_404(db, project_id)
+    rows = db.scalars(
+        select(AgentActivity)
+        .where(AgentActivity.project_id == project_id)
+        .order_by(AgentActivity.created_at.desc(), AgentActivity.id.desc())
+        .limit(100)
+    ).all()
+    session_ids = {row.session_id for row in rows if row.session_id}
+    names = (
+        {
+            session.id: session.agent_name
+            for session in db.scalars(
+                select(AgentSession).where(AgentSession.id.in_(session_ids))
+            ).all()
+        }
+        if session_ids
+        else {}
+    )
+    return [
+        {
+            "id": row.id,
+            "kind": row.kind,
+            "tool_name": row.tool_name,
+            "summary": row.summary,
+            "evidence": json.loads(row.evidence_json or "[]"),
+            "origin": row.origin,
+            "session_id": row.session_id,
+            "agent_name": names.get(row.session_id),
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ]
 
 
 @router.post("/projects/{project_id}/agent-answer")
@@ -299,47 +338,108 @@ async def answer(project_id: str, body: AgentAnswerRequest, db: DBSession):
     }
 
 
-# A deterministic document ID makes re-seeding safe after a partial provider failure.
+@router.post("/projects/{project_id}/run-mcp-demo")
+async def run_mcp_demo(project_id: str, db: DBSession):
+    """Invoke the registered MCP tool, then log a labelled local sample result."""
+    project = project_or_404(db, project_id)
+    task = "Implement login and refresh-token flow for this project."
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "recall_project_memory",
+            {"project_id": project.id, "task_description": task, "top_k": 5},
+        )
+    if result.is_error:
+        raise HTTPException(502, "The MCP recall tool did not complete.")
+    payload = result.structured_content
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(result.content[0].text)
+        except (IndexError, AttributeError, ValueError) as exc:
+            raise HTTPException(502, "The MCP tool returned no structured result.") from exc
+    memories = payload.get("memories", [])
+    jwt_seen = any(
+        "http-only" in item.get("text", "").lower()
+        or "httponly" in item.get("text", "").lower()
+        for item in memories
+    )
+    if jwt_seen:
+        sample = (
+            "Local sample result - not an external coding agent: "
+            "Use short-lived access tokens and put refresh tokens in HttpOnly, "
+            "Secure cookies. Rotate refresh tokens on use. Do not use LocalStorage."
+        )
+    else:
+        sample = (
+            "Local sample result - not an external coding agent: "
+            "No JWT storage rule was recalled. Confirm the project's security "
+            "decision before choosing refresh-token storage."
+        )
+    session = db.get(AgentSession, payload["session_id"])
+    AuditEventService.activity(
+        db, project, session, "agent_result", sample,
+        payload["origin"], evidence=memories,
+    )
+    db.commit()
+    return {
+        "tool_call": "projectpulse.recall_project_memory",
+        "task": task,
+        "memories": memories,
+        "sample_result": sample,
+        "session_id": payload["session_id"],
+        "origin": payload["origin"],
+        "mode_label": payload["mode_label"],
+    }
+
+
+# Stable IDs make repeated demo seeds safe in both Hindsight and local demo mode.
 SEED = [
     (
-        "jwt-cookie-rule",
-        "architecture decision",
-        "JWT refresh tokens must be stored in HTTP-only cookies. Never use localStorage because it increases XSS exposure.",
+        "jwt-security-v2",
+        "security_rule",
+        "JWT refresh tokens must use HTTP-only, Secure cookies. LocalStorage is forbidden.",
+        ["authentication", "security"],
     ),
     (
-        "payment-pool-fix",
-        "bug fix",
-        "Payment timeouts were caused by database connection-pool exhaustion; increasing the pool size worked.",
+        "task-api-v2",
+        "api_contract",
+        "POST /api/tasks returns the created task with HTTP 201.",
+        ["tasks", "api"],
     ),
     (
-        "task-api-contract",
-        "coding convention",
-        "POST /api/tasks returns taskId and uses one fixed validation-error format.",
+        "order-delete-v2",
+        "architecture_decision",
+        "Orders use soft deletes to preserve audit history.",
+        ["orders", "data"],
     ),
     (
-        "react-query-state",
-        "coding convention",
-        "React Query owns server state; do not duplicate it in a global store.",
+        "payment-pool-v2",
+        "incident_fix",
+        "Payment worker connection-pool exhaustion was fixed by limiting pool size and queueing retries.",
+        ["payments", "incident"],
     ),
     (
-        "orders-soft-delete",
-        "architecture decision",
-        "Orders use soft delete; never permanently delete completed orders.",
+        "react-query-v2",
+        "coding_convention",
+        "Use React Query for server state; do not duplicate API state in global client stores.",
+        ["frontend", "react"],
     ),
     (
-        "rollback-failed",
-        "failed approach",
+        "payment-rollback-v2",
+        "incident_fix",
         "Rollback alone did not solve the payment-timeout incident.",
+        ["payments", "failed-approach"],
     ),
     (
-        "signed-product-images",
-        "feature progress",
+        "signed-images-v2",
+        "architecture_decision",
         "Product images are uploaded through a signed URL flow.",
+        ["images", "uploads"],
     ),
     (
-        "cart-local-state",
-        "architecture decision",
+        "cart-local-v2",
+        "architecture_decision",
         "Cart state remains local until checkout succeeds.",
+        ["cart", "checkout"],
     ),
 ]
 
@@ -349,7 +449,6 @@ async def seed(project_id: str, db: DBSession):
     project = project_or_404(db, project_id)
     if project.name != "E-commerce Platform":
         raise HTTPException(400, "Demo data is only available for E-commerce Platform.")
-
     existing = set()
     for event in db.scalars(
         select(MemoryEvent).where(
@@ -364,51 +463,22 @@ async def seed(project_id: str, db: DBSession):
         except json.JSONDecodeError:
             continue
 
-    pending = [
-        (f"seed-{slug}", kind, text)
-        for slug, kind, text in SEED
-        if f"seed-{slug}" not in existing
-    ]
-    if pending:
-        agent = "Agent A - previous session"
-        now = datetime.now(timezone.utc).isoformat()
-        items = [
-            {
-                "content": retained_content(project, kind, agent, text),
-                "document_id": document_id,
-                "metadata": {
-                    "project_id": project.id,
-                    "memory_type": kind,
-                    "source_agent": agent,
-                    "seed": "true",
-                },
-                "tags": [f"project:{project.id}", f"type:{kind.replace(' ', '-')}"],
-                "timestamp": now,
-            }
-            for document_id, kind, text in pending
-        ]
-        response = await hindsight.retain_batch(project.hindsight_bank_id, items)
-        if response.get("success") is False:
-            raise HTTPException(
-                502, "Hindsight did not confirm the demo Retain operation."
-            )
-        session = AgentSession(
-            project_id=project.id,
-            agent_name=agent,
-            task="Retain E-commerce demo decisions",
+    seeded = 0
+    for slug, kind, content, tags in SEED:
+        document_id = f"seed-{slug}"
+        if document_id in existing:
+            continue
+        await memory_service.retain(
+            db,
+            project.id,
+            content,
+            kind,
+            tags,
+            source_agent="Agent A - previous session",
+            document_id=document_id,
+            tool_name="demo.seed",
         )
-        db.add(session)
-        db.flush()
-        for document_id, kind, text in pending:
-            db.add(
-                MemoryEvent(
-                    project_id=project.id,
-                    session_id=session.id,
-                    event_type="retained",
-                    source_text=retained_content(project, kind, agent, text),
-                    hindsight_memory_reference=json.dumps({"document_id": document_id}),
-                )
-            )
+        seeded += 1
 
     scenario = db.scalar(
         select(DemoScenario).where(
@@ -421,9 +491,21 @@ async def seed(project_id: str, db: DBSession):
             DemoScenario(
                 project_id=project.id,
                 title="Fresh Agent B: authentication",
-                task="Build the login screen and authentication flow.",
+                task="Implement login and refresh-token flow for this project.",
                 expected_memory_ids="[]",
             )
         )
     db.commit()
-    return {"seeded": len(pending), "project": project_dto(project)}
+    return {
+        "seeded": seeded,
+        "project": project_dto(project),
+        "mode_label": (
+            "Demo mode - local sample memory"
+            if demo_mode(project)
+            else "Hindsight connected"
+        ),
+    }
+
+
+
+

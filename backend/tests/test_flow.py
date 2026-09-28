@@ -1,4 +1,4 @@
-"""ProjectPulse contract and end-to-end API tests with provider boundaries stubbed."""
+﻿"""ProjectPulse contract and end-to-end API tests with provider boundaries stubbed."""
 
 import json
 import os
@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.api import routes
 from app.db.database import engine
+from app.services import mcp_server
 from app.main import app
 from app.services.groq_service import GroqService
 from app.services.hindsight_service import HindsightService
@@ -54,6 +55,22 @@ class FakeHindsight:
             ]
             self.banks[bank_id].append(item)
         return {"success": True, "items_count": len(items)}
+
+    async def list_memories(self, bank_id, project_id, memory_type=None, tag=None):
+        items = [
+            {
+                "id": item["document_id"], "text": item["content"],
+                "type": item["metadata"]["memory_type"],
+                "tags": item["tags"], "metadata": item["metadata"],
+                "source_agent": item["metadata"]["source_agent"],
+                "session_id": item["metadata"].get("session_id"),
+                "timestamp": "2026-09-28T10:00:00Z", "origin": "hindsight",
+            }
+            for item in self.banks[bank_id]
+            if (not memory_type or item["metadata"]["memory_type"] == memory_type)
+            and (not tag or tag in item["tags"])
+        ]
+        return items
 
     async def recall(self, bank_id, project_id, query, limit):
         self.recall_calls.append((bank_id, project_id, query))
@@ -94,8 +111,12 @@ class FlowTests(unittest.TestCase):
     def setUpClass(cls):
         cls.old_hindsight = routes.hindsight
         cls.old_groq = routes.groq
+        cls.old_service_hindsight = routes.memory_service.hindsight
+        cls.old_mcp_hindsight = mcp_server.service.hindsight
         cls.fake_hindsight = FakeHindsight()
         routes.hindsight = cls.fake_hindsight
+        routes.memory_service.hindsight = cls.fake_hindsight
+        mcp_server.service.hindsight = cls.fake_hindsight
         routes.groq = FakeGroq()
         cls.client = TestClient(app)
 
@@ -103,6 +124,8 @@ class FlowTests(unittest.TestCase):
     def tearDownClass(cls):
         routes.hindsight = cls.old_hindsight
         routes.groq = cls.old_groq
+        routes.memory_service.hindsight = cls.old_service_hindsight
+        mcp_server.service.hindsight = cls.old_mcp_hindsight
         cls.client.close()
         engine.dispose()
         _test_dir.cleanup()
@@ -154,7 +177,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(answer["session"]["agent_name"], "Agent B - fresh session")
         self.assertEqual(
             json.loads(answer["event"]["hindsight_memory_reference"]),
-            ["seed-jwt-cookie-rule"],
+            ["seed-jwt-security-v2"],
         )
         self.assertEqual(
             self.fake_hindsight.recall_calls[-1][0], ecom["hindsight_bank_id"]
@@ -199,6 +222,25 @@ class FlowTests(unittest.TestCase):
             422,
         )
         self.assertEqual(self.client.get("/projects/not-a-uuid").status_code, 422)
+
+        listed = self.client.get(f"/projects/{ecom['id']}/memories")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()["origin"], "hindsight")
+        self.assertEqual(listed.json()["count"], 9)
+
+        mcp_demo = self.client.post(f"/projects/{ecom['id']}/run-mcp-demo")
+        self.assertEqual(mcp_demo.status_code, 200, mcp_demo.text)
+        self.assertEqual(
+            mcp_demo.json()["tool_call"], "projectpulse.recall_project_memory"
+        )
+        self.assertIn("HTTP-only", mcp_demo.json()["memories"][0]["text"])
+        self.assertIn("not an external coding agent", mcp_demo.json()["sample_result"])
+        activity = self.client.get(f"/projects/{ecom['id']}/activity").json()
+        self.assertTrue(any(
+            item["tool_name"] == "projectpulse.recall_project_memory"
+            for item in activity
+        ))
+        self.assertTrue(any(item["kind"] == "agent_result" for item in activity))
 
 
 class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
@@ -249,3 +291,4 @@ class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -53,3 +53,37 @@ class DemoScenario(Base):
     title: Mapped[str] = mapped_column(String(180))
     task: Mapped[str] = mapped_column(Text)
     expected_memory_ids: Mapped[str] = mapped_column(Text, default="[]")
+
+
+class DemoMemory(Base):
+    """Local sample memory; never presented as Hindsight data."""
+
+    __tablename__ = "demo_memories"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    document_id: Mapped[str] = mapped_column(String(180), unique=True)
+    content: Mapped[str] = mapped_column(Text)
+    memory_type: Mapped[str] = mapped_column(String(60))
+    tags_json: Mapped[str] = mapped_column(Text, default="[]")
+    source_agent: Mapped[str] = mapped_column(String(120))
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_sessions.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentActivity(Base):
+    """Visible audit of real MCP calls and explicitly labelled demo results."""
+
+    __tablename__ = "agent_activity"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_sessions.id"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    tool_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    summary: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text, default="[]")
+    origin: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
