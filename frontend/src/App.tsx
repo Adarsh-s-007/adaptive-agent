@@ -1,4 +1,5 @@
-﻿import { FormEvent, useEffect, useMemo, useState } from "react";
+﻿import { FormEvent, lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { AnimatePresence, motion, MotionConfig } from "framer-motion";
 import {
   Activity,
   api,
@@ -10,6 +11,23 @@ import {
   Project,
   Stats,
 } from "./api";
+import {
+  AnimatedNumber,
+  bannerMotion,
+  hoverLift,
+  listItem,
+  modalMotion,
+  overlayMotion,
+  rise,
+  stagger,
+  tabMotion,
+  useButtonRipples,
+} from "./motion";
+import { hasWebGL, memoryColor, MEMORY_TYPES } from "./three/support";
+
+// three.js is only downloaded when the browser can actually render it.
+const SceneBackground = lazy(() => import("./three/SceneBackground"));
+const MemoryOrbit = lazy(() => import("./three/MemoryOrbit"));
 
 type Tab = "overview" | "timeline" | "activity" | "setup";
 type Target = "Claude Code" | "GitHub Copilot";
@@ -59,6 +77,8 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [retry, setRetry] = useState<(() => void) | null>(null);
   const [demoResult, setDemoResult] = useState<McpDemo | null>(null);
+  const webgl = useMemo(hasWebGL, []);
+  useButtonRipples();
 
   async function loadProject(next: Project) {
     const [nextEvents, nextStats, nextMemories, nextActivities] = await Promise.all([
@@ -197,6 +217,11 @@ export default function App() {
   );
   const latestResult = activities.find((activity) => activity.kind === "agent_result");
   const recalledEvidence = latestMcpRecall?.evidence || demoResult?.memories || [];
+  const recalledKey = recalledEvidence.map((memory) => memory.id).join("|");
+  const recalledIds = useMemo(() => new Set(recalledKey ? recalledKey.split("|") : []), [recalledKey]);
+  const typeCounts = MEMORY_TYPES
+    .map((type) => [type, memories.filter((memory) => memory.type === type).length] as const)
+    .filter(([, count]) => count > 0);
   const status = project?.memory_mode === "demo"
     ? "Demo mode"
     : project?.memory_mode === "hindsight"
@@ -231,10 +256,20 @@ export default function App() {
       }, null, 2);
 
   return (
+    <MotionConfig reducedMotion="user">
+    {webgl && <Suspense fallback={null}><SceneBackground /></Suspense>}
     <main>
-      <header>
+      <motion.header
+        initial={{ opacity: 0, y: -12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+      >
         <div className="brand">
-          <span className="logo">{"\u2726"}</span>
+          <motion.span
+            className="logo"
+            whileHover={{ rotate: 180, scale: 1.12 }}
+            transition={{ type: "spring", stiffness: 260, damping: 16 }}
+          >{"\u2726"}</motion.span>
           <span>Project<span>Pulse</span></span>
           <em>Cross-agent engineering memory</em>
         </div>
@@ -244,7 +279,7 @@ export default function App() {
           </span>
           <button className="ghost" onClick={() => setModal("project")}>+ New project</button>
         </div>
-      </header>
+      </motion.header>
 
       <section className="topbar">
         <div>
@@ -275,39 +310,60 @@ export default function App() {
         )}
       </section>
 
-      {error && (
-        <div className="error" role="alert">
-          <span>{error}</span>
-          <div className="error-actions">
-            {retry && <button onClick={retry} disabled={!!busy}>Retry</button>}
-            <button aria-label="Dismiss error" onClick={() => setError("")}>x</button>
-          </div>
-        </div>
-      )}
-      {notice && <div className="notice" role="status">{notice}</div>}
+      <AnimatePresence initial={false}>
+        {error && (
+          <motion.div key="error" className="banner-wrap" {...bannerMotion}>
+            <div className="error" role="alert">
+              <span>{error}</span>
+              <div className="error-actions">
+                {retry && <button onClick={retry} disabled={!!busy}>Retry</button>}
+                <button aria-label="Dismiss error" onClick={() => setError("")}>x</button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+        {notice && (
+          <motion.div key={"notice-" + notice} className="banner-wrap" {...bannerMotion}>
+            <div className="notice" role="status">{notice}</div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {!project ? (
-        <section className="empty">
-          <div className="empty-icon">{"\u2311"}</div>
-          <p className="eyebrow">MCP-FIRST ENGINEERING MEMORY</p>
-          <h1>Persistent project memory for coding agents.</h1>
-          <p>
+        <motion.section className="empty" variants={stagger} initial="hidden" animate="show">
+          <motion.div className="empty-icon" variants={rise}>
+            <motion.span
+              animate={{ y: [0, -9, 0], rotate: [0, 6, 0] }}
+              transition={{ duration: 4.5, repeat: Infinity, ease: "easeInOut" }}
+            >{"\u2311"}</motion.span>
+          </motion.div>
+          <motion.p className="eyebrow" variants={rise}>MCP-FIRST ENGINEERING MEMORY</motion.p>
+          <motion.h1 variants={rise}>Persistent project memory for coding agents.</motion.h1>
+          <motion.p variants={rise}>
             ProjectPulse connects your coding agent to a project-scoped Hindsight memory bank.
             New sessions recall the decisions that matter before they write code.
-          </p>
-          <div className="landing-actions">
-            <button className="primary big" onClick={launchDemo} disabled={!!busy}>
+          </motion.p>
+          <motion.div className="landing-actions" variants={rise}>
+            <motion.button className="primary big" onClick={launchDemo} disabled={!!busy}
+              whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {busy === "demo" ? "Preparing demo..." : "Launch E-commerce MCP demo"}
-            </button>
-            <button className="ghost big" onClick={() => setModal("project")}>
+            </motion.button>
+            <motion.button className="ghost big" onClick={() => setModal("project")}
+              whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               Create project
-            </button>
-          </div>
-          {isDemo && <p className="mode-note">Demo mode - local sample memory. Add a Hindsight key for real cloud memory.</p>}
-        </section>
+            </motion.button>
+          </motion.div>
+          {isDemo && <motion.p className="mode-note" variants={rise}>Demo mode - local sample memory. Add a Hindsight key for real cloud memory.</motion.p>}
+        </motion.section>
       ) : (
         <>
-          <section className="hero">
+          <motion.section
+            key={"hero-" + project.id}
+            className="hero"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+          >
             <div>
               <p className="eyebrow">{project.name}</p>
               <h1>{project.description || "An isolated engineering memory bank for this project."}</h1>
@@ -325,7 +381,7 @@ export default function App() {
                 + Retain memory
               </button>
             </div>
-          </section>
+          </motion.section>
 
           <nav className="section-nav" aria-label="Dashboard sections">
             {([
@@ -338,27 +394,36 @@ export default function App() {
                 key={key}
                 className={tab === key ? "active" : ""}
                 onClick={() => setTab(key)}
-              >{label}</button>
+              >
+                {label}
+                {tab === key && (
+                  <motion.span
+                    layoutId="tab-underline"
+                    className="tab-underline"
+                    transition={{ type: "spring", stiffness: 480, damping: 36 }}
+                  />
+                )}
+              </button>
             ))}
           </nav>
 
           {tab === "overview" && (
-            <section className="tab-content">
-              <div className="overview-grid">
-                <article className="panel emphasis">
+            <motion.section key="overview" className="tab-content" {...tabMotion}>
+              <motion.div className="overview-grid" variants={stagger} initial="hidden" animate="show">
+                <motion.article className="panel emphasis" variants={rise} {...hoverLift}>
                   <p className="eyebrow">MEMORY CONNECTION</p>
                   <h2>{project.memory_mode === "demo" ? "Demo mode" : "Hindsight connected"}</h2>
                   <p>{project.memory_mode === "demo"
                     ? "Local sample memory is isolated to this project. It is not Hindsight."
                     : "Retain, Recall, and List use this project's Hindsight Cloud bank."}</p>
                   <code>{project.hindsight_bank_id}</code>
-                </article>
-                <article className="panel number-panel">
+                </motion.article>
+                <motion.article className="panel number-panel" variants={rise} {...hoverLift}>
                   <p className="eyebrow">RETAINED MEMORIES</p>
-                  <strong>{memories.length}</strong>
+                  <strong><AnimatedNumber value={memories.length} /></strong>
                   <p>Inspectable facts in the selected project bank. {stats.retained} retain events logged.</p>
-                </article>
-                <article className="panel">
+                </motion.article>
+                <motion.article className="panel" variants={rise} {...hoverLift}>
                   <p className="eyebrow">LATEST RECALL</p>
                   {latestRecall ? (
                     <>
@@ -367,9 +432,42 @@ export default function App() {
                       <small>{timeLabel(latestRecall.created_at)}</small>
                     </>
                   ) : <p>No recall yet. Start the MCP demo to create an audit event.</p>}
-                </article>
-              </div>
-              <div className="feature-strip">
+                </motion.article>
+                <motion.article className="panel orbit-panel" variants={rise}>
+                  <div className="orbit-head">
+                    <div>
+                      <p className="eyebrow">MEMORY CONSTELLATION</p>
+                      <h2>Project knowledge in orbit</h2>
+                      <p>
+                        Each node is a retained memory orbiting this project's bank, grouped by type.
+                        Recalled evidence pulses. Hover a node to read it, click to inspect.
+                      </p>
+                    </div>
+                    <ul className="orbit-legend" aria-label="Memory types">
+                      {typeCounts.length ? typeCounts.map(([type, count]) => (
+                        <li key={type}>
+                          <i style={{ background: memoryColor(type), boxShadow: "0 0 10px " + memoryColor(type) }} />
+                          {kindLabel(type)} <b>{count}</b>
+                        </li>
+                      )) : <li className="muted-legend">No memories retained yet</li>}
+                      {recalledIds.size > 0 && <li className="recalled-legend"><i /> Recalled by Agent B</li>}
+                    </ul>
+                  </div>
+                  {webgl ? (
+                    <Suspense fallback={<div className="orbit-canvas orbit-loading" />}>
+                      <MemoryOrbit memories={memories} highlighted={recalledIds} onSelect={setSelectedMemory} />
+                    </Suspense>
+                  ) : (
+                    <p className="orbit-fallback">3D view needs WebGL, which this browser doesn't provide.</p>
+                  )}
+                </motion.article>
+              </motion.div>
+              <motion.div
+                className="feature-strip"
+                initial={{ opacity: 0, y: 18 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.5, delay: 0.3, ease: [0.22, 1, 0.36, 1] }}
+              >
                 <div>
                   <p className="eyebrow">JUDGE-FACING PROOF</p>
                   <h2>See the actual MCP call.</h2>
@@ -381,12 +479,12 @@ export default function App() {
                 <button className="primary" onClick={runMcpDemo} disabled={!!busy}>
                   {busy === "mcp" ? "Calling MCP tool..." : "Run fresh Agent B MCP demo"}
                 </button>
-              </div>
-            </section>
+              </motion.div>
+            </motion.section>
           )}
 
           {tab === "timeline" && (
-            <section className="tab-content">
+            <motion.section key="timeline" className="tab-content" {...tabMotion}>
               <div className="section-title">
                 <div>
                   <p className="eyebrow">PROJECT KNOWLEDGE</p>
@@ -418,9 +516,12 @@ export default function App() {
               </div>
               {filteredMemories.length ? (
                 <ol className="memory-list">
-                  {filteredMemories.map((memory) => (
-                    <li key={memory.id}>
-                      <button onClick={() => setSelectedMemory(memory)}>
+                  {filteredMemories.map((memory, index) => (
+                    <motion.li key={memory.id} layout="position" {...listItem(index)}>
+                      <button
+                        onClick={() => setSelectedMemory(memory)}
+                        style={{ borderLeftColor: memoryColor(memory.type) }}
+                      >
                         <div className="memory-list-head">
                           <span className="type-pill">{kindLabel(memory.type)}</span>
                           <time>{timeLabel(memory.timestamp)}</time>
@@ -435,7 +536,7 @@ export default function App() {
                           (tag) => <span key={tag}>#{tag}</span>
                         )}</div>
                       </button>
-                    </li>
+                    </motion.li>
                   ))}
                 </ol>
               ) : (
@@ -448,19 +549,19 @@ export default function App() {
                   <h3>Retain and recall audit</h3>
                   <button className="ghost" onClick={() => void perform("refresh", () => loadProject(project))}>Refresh</button>
                 </div>
-                {events.length ? events.map((event) => (
-                  <div key={event.id} className="audit-mini-row">
+                {events.length ? events.map((event, index) => (
+                  <motion.div key={event.id} className="audit-mini-row" {...listItem(index)}>
                     <span className={"dot " + event.event_type} />
                     <span>{event.agent_name || "An agent"} {event.event_type === "retained" ? "retained" : "recalled"}: {eventText(event)}</span>
                     <time>{timeLabel(event.created_at)}</time>
-                  </div>
+                  </motion.div>
                 )) : <p className="muted">No audit events yet.</p>}
               </div>
-            </section>
+            </motion.section>
           )}
 
           {tab === "activity" && (
-            <section className="tab-content">
+            <motion.section key="activity" className="tab-content" {...tabMotion}>
               <div className="section-title">
                 <div>
                   <p className="eyebrow">REAL TOOL-CALL EVIDENCE</p>
@@ -477,7 +578,13 @@ export default function App() {
               <div className="activity-layout">
                 <div className="activity-stream">
                   {visibleActivities.length ? [...visibleActivities].reverse().map((item, index) => (
-                    <article key={item.id} className={"activity-item " + item.kind}>
+                    <motion.article
+                      key={item.id}
+                      className={"activity-item " + item.kind}
+                      initial={{ opacity: 0, y: 14 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.4, delay: Math.min(index, 10) * 0.12, ease: [0.22, 1, 0.36, 1] }}
+                    >
                       <span className="step-index">{String(index + 1).padStart(2, "0")}</span>
                       <div>
                         <div className="activity-title">
@@ -494,23 +601,28 @@ export default function App() {
                           ? "Demo mode - local sample memory"
                           : "Hindsight"}</small>
                       </div>
-                    </article>
+                    </motion.article>
                   )) : (
                     <div className="empty-panel">
                       No agent activity yet. Run the MCP demo or connect a coding agent in MCP setup.
                     </div>
                   )}
                 </div>
-                <aside className="proof-panel">
+                <motion.aside
+                  className="proof-panel"
+                  initial={{ opacity: 0, x: 18 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.5, delay: 0.15, ease: [0.22, 1, 0.36, 1] }}
+                >
                   <p className="eyebrow">WHY THIS ANSWER IS PROJECT-AWARE</p>
                   <h3>Exact recalled memory</h3>
-                  {recalledEvidence.length ? recalledEvidence.map((memory) => (
-                    <div className="proof-memory" key={memory.id}>
+                  {recalledEvidence.length ? recalledEvidence.map((memory, index) => (
+                    <motion.div className="proof-memory" key={memory.id} {...listItem(index + 2)}>
                       <span className="type-pill">{kindLabel(memory.type)}</span>
                       <p>{memory.text}</p>
                       <small>{memory.source_agent || memory.metadata.source_agent || "Project agent"}
                         {" | "}{timeLabel(memory.timestamp)}</small>
-                    </div>
+                    </motion.div>
                   )) : <p className="muted">Run the fresh Agent B MCP demo to see the evidence.</p>}
                   {latestResult && (
                     <div className="sample-result">
@@ -519,13 +631,13 @@ export default function App() {
                     </div>
                   )}
                   {demoResult && <small>Actual call: {demoResult.tool_call}</small>}
-                </aside>
+                </motion.aside>
               </div>
-            </section>
+            </motion.section>
           )}
 
           {tab === "setup" && (
-            <section className="tab-content">
+            <motion.section key="setup" className="tab-content" {...tabMotion}>
               <div className="section-title">
                 <div>
                   <p className="eyebrow">CONNECT YOUR CODING AGENT</p>
@@ -533,8 +645,8 @@ export default function App() {
                   <p className="sub">The coding agent calls these tools; this dashboard only manages evidence.</p>
                 </div>
               </div>
-              <div className="setup-grid">
-                <div className="panel">
+              <motion.div className="setup-grid" variants={stagger} initial="hidden" animate="show">
+                <motion.div className="panel" variants={rise}>
                   <label>
                     Coding-agent target
                     <select value={target} onChange={(event) => setTarget(event.target.value as Target)}>
@@ -550,8 +662,8 @@ export default function App() {
                   </p>
                   <div className="code-head"><span>MCP server configuration</span><button className="ghost" onClick={() => void copy(config)}>Copy</button></div>
                   <pre>{config}</pre>
-                </div>
-                <div className="panel">
+                </motion.div>
+                <motion.div className="panel" variants={rise}>
                   <p className="eyebrow">PROJECT INSTRUCTIONS</p>
                   <p className="setup-hint">
                     Put this in the coding project's {target === "Claude Code"
@@ -561,38 +673,44 @@ export default function App() {
                   <div className="code-head"><span>Agent instructions</span><button className="ghost" onClick={() => void copy(instructionSnippet)}>Copy</button></div>
                   <pre>{instructionSnippet}</pre>
                   <p className="setup-hint">Project ID: <code>{project.id}</code></p>
-                </div>
-              </div>
+                </motion.div>
+              </motion.div>
               <div className="setup-footer">
                 <strong>Available tools</strong>
                 <span>recall_project_memory</span>
                 <span>retain_project_memory</span>
                 <span>list_project_memories</span>
               </div>
-            </section>
+            </motion.section>
           )}
         </>
       )}
 
-      {modal === "project" && <ProjectModal
-        close={() => setModal(null)}
-        save={createProject}
-        saving={busy === "project"}
-        error={error}
-      />}
-      {modal === "memory" && <MemoryModal
-        close={() => setModal(null)}
-        save={retainMemory}
-        saving={busy === "retain"}
-        error={error}
-        showExample={project?.name === "E-commerce Platform"}
-        demo={project?.memory_mode === "demo"}
-      />}
-      {selectedMemory && <MemoryDetail
-        memory={selectedMemory}
-        close={() => setSelectedMemory(null)}
-      />}
+      <AnimatePresence>
+        {modal === "project" && <ProjectModal
+          key="project-modal"
+          close={() => setModal(null)}
+          save={createProject}
+          saving={busy === "project"}
+          error={error}
+        />}
+        {modal === "memory" && <MemoryModal
+          key="memory-modal"
+          close={() => setModal(null)}
+          save={retainMemory}
+          saving={busy === "retain"}
+          error={error}
+          showExample={project?.name === "E-commerce Platform"}
+          demo={project?.memory_mode === "demo"}
+        />}
+        {selectedMemory && <MemoryDetail
+          key="memory-detail"
+          memory={selectedMemory}
+          close={() => setSelectedMemory(null)}
+        />}
+      </AnimatePresence>
     </main>
+    </MotionConfig>
   );
 }
 
@@ -612,8 +730,8 @@ function ProjectModal({
       description: String(form.get("description") || ""),
     });
   };
-  return <div className="overlay">
-    <form className="modal" onSubmit={submit}>
+  return <motion.div className="overlay" {...overlayMotion}>
+    <motion.form className="modal" onSubmit={submit} {...modalMotion}>
       <button type="button" className="close" onClick={close} aria-label="Close dialog">x</button>
       <p className="eyebrow">NEW PROJECT</p>
       <h2>Create an isolated memory bank</h2>
@@ -623,8 +741,8 @@ function ProjectModal({
       <button className="primary" disabled={saving}>
         {saving ? "Creating..." : "Create project"}
       </button>
-    </form>
-  </div>;
+    </motion.form>
+  </motion.div>;
 }
 
 function MemoryModal({
@@ -649,8 +767,8 @@ function MemoryModal({
       tags: String(form.get("tags") || "").split(",").map((tag) => tag.trim()).filter(Boolean),
     });
   };
-  return <div className="overlay">
-    <form className="modal" onSubmit={submit}>
+  return <motion.div className="overlay" {...overlayMotion}>
+    <motion.form className="modal" onSubmit={submit} {...modalMotion}>
       <button type="button" className="close" onClick={close} aria-label="Close dialog">x</button>
       <p className="eyebrow">RETAIN ENGINEERING LEARNING</p>
       <h2>Give the next agent a useful head start.</h2>
@@ -683,16 +801,16 @@ function MemoryModal({
       <button className="primary" disabled={saving}>
         {saving ? "Saving..." : demo ? "Retain in Demo mode" : "Retain through Hindsight"}
       </button>
-    </form>
-  </div>;
+    </motion.form>
+  </motion.div>;
 }
 
 function MemoryDetail({ memory, close }: { memory: Memory; close: () => void }) {
-  return <div className="overlay">
-    <div className="modal detail-modal" role="dialog" aria-modal="true" aria-label="Memory details">
+  return <motion.div className="overlay" onClick={(event) => event.target === event.currentTarget && close()} {...overlayMotion}>
+    <motion.div className="modal detail-modal" role="dialog" aria-modal="true" aria-label="Memory details" {...modalMotion}>
       <button className="close" onClick={close} aria-label="Close memory details">x</button>
       <p className="eyebrow">PROJECT MEMORY DETAIL</p>
-      <span className="type-pill">{kindLabel(memory.type)}</span>
+      <span className="type-pill" style={{ borderColor: memoryColor(memory.type) }}>{kindLabel(memory.type)}</span>
       <h2>{memory.text}</h2>
       <div className="detail-grid">
         <div><small>Source agent</small><strong>{memory.source_agent || memory.metadata.source_agent || "Unknown"}</strong></div>
@@ -702,6 +820,6 @@ function MemoryDetail({ memory, close }: { memory: Memory; close: () => void }) 
       </div>
       <div className="tag-list">{(memory.tags || []).map((tag) => <span key={tag}>#{tag}</span>)}</div>
       <small className="memory-id">Memory ID: {memory.id}</small>
-    </div>
-  </div>;
+    </motion.div>
+  </motion.div>;
 }

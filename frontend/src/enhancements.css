@@ -1,0 +1,72 @@
+/* 3D + motion layer. The WebGL canvas is fixed at z-index 0; all real content sits above it. */
+body{background:radial-gradient(circle at 68% -10%,#252059 0,transparent 34%),radial-gradient(circle at 10% 110%,#0f2d33 0,transparent 38%),#080b16;background-attachment:fixed}
+#root{position:relative;min-height:100vh}
+main{position:relative;z-index:1}
+.scene-background{position:fixed!important;inset:0;z-index:0;pointer-events:none}
+.scene-background canvas{pointer-events:none}
+header{position:relative}
+
+/* Slightly translucent, blurred surfaces so the scene reads through without hurting contrast. */
+.panel,.feature-strip,.proof-panel,.memory-list li button,.audit-mini,.setup-footer{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.panel{background:#101527e6}
+.panel.emphasis{background:linear-gradient(145deg,#1d2045eb,#11172ee6)}
+.memory-list li button{background:#111629e6;border-left:3px solid #8574ff;transition:border-color .2s,background .2s,transform .2s,box-shadow .2s}
+.memory-list li button:hover{transform:translateX(3px);box-shadow:0 10px 30px #0006}
+.panel{transition:border-color .25s,box-shadow .25s}
+.panel:hover{border-color:#5b58a8;box-shadow:0 18px 44px #0007,0 0 0 1px #7c6cf522}
+
+/* Tabs: animated gradient underline (framer layoutId) replaces the static border. */
+.section-nav button{position:relative}
+.section-nav button.active{border-bottom-color:transparent}
+.tab-underline{position:absolute;left:10px;right:10px;bottom:-1px;height:2px;border-radius:2px;background:linear-gradient(90deg,#8f80ff,#52d9ca);box-shadow:0 0 12px #8f80ffaa}
+
+/* Button ink ripple */
+button{position:relative;overflow:hidden;isolation:isolate;transition:filter .2s,transform .15s,border-color .2s,background .2s}
+button.close{position:absolute}
+button:active:not(:disabled){transform:scale(.98)}
+.btn-ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,#ffffff55 0,#ffffff22 40%,transparent 70%);transform:scale(0);animation:btn-ripple .65s cubic-bezier(.22,1,.36,1) forwards;z-index:-1}
+@keyframes btn-ripple{to{transform:scale(1);opacity:0}}
+.primary{background-size:200% 100%;background-image:linear-gradient(110deg,#7f6cf0,#6655db 45%,#7d6bf5 55%,#6655db);background-position:100% 0;transition:background-position .6s,filter .2s,box-shadow .3s}
+.primary:hover:not(:disabled){background-position:0 0;box-shadow:0 12px 30px #5b4bd066}
+button:disabled{opacity:.6;cursor:progress}
+
+/* Live status dot */
+.live i{animation:live-pulse 2.2s ease-in-out infinite}
+@keyframes live-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.6);opacity:.55}}
+
+.banner-wrap{overflow:hidden}
+.empty-icon span{display:inline-block;filter:drop-shadow(0 0 18px #8d7cff88)}
+.logo{box-shadow:0 0 18px #8d7cff66}
+
+/* Memory constellation */
+.overview-grid .orbit-panel{grid-column:1/-1;padding:23px 23px 10px;overflow:hidden;background:radial-gradient(circle at 50% 62%,#221d5299 0,transparent 55%),#0e1224eb}
+.orbit-head{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap}
+.orbit-head>div{max-width:560px}
+.orbit-head h2{margin-bottom:6px!important}
+.orbit-legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;max-width:520px}
+.orbit-legend li{display:flex;align-items:center;gap:7px;font-size:11px;color:#b9c1db;border:1px solid #2d3456;background:#0b1022cc;border-radius:99px;padding:5px 10px}
+.orbit-legend li i{width:8px;height:8px;border-radius:99px;display:inline-block}
+.orbit-legend li b{font-family:'DM Mono',monospace;font-weight:500;color:#eef0ff}
+.orbit-legend .recalled-legend i{background:transparent;border:2px solid #fff;box-shadow:0 0 8px #fff}
+.orbit-legend .muted-legend{color:#7f89a8}
+.orbit-canvas{position:relative;height:340px;margin:4px -23px 0;cursor:grab}
+.orbit-canvas:active{cursor:grabbing}
+.orbit-loading{background:radial-gradient(circle at 50% 50%,#2a2466 0,transparent 30%);animation:orbit-load 1.4s ease-in-out infinite}
+@keyframes orbit-load{50%{opacity:.4}}
+.orbit-tooltip{position:absolute;pointer-events:none;transform:translate(14px,-50%);width:min(300px,60%);background:#141a33f2;border:1px solid #4c4a86;border-radius:10px;padding:11px 13px;box-shadow:0 18px 40px #000a;z-index:2;backdrop-filter:blur(8px)}
+.orbit-tooltip span{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.orbit-tooltip p{margin:6px 0!important;color:#e6e9fb!important;font-size:12px!important;line-height:1.5!important}
+.orbit-tooltip small{font-size:10px;color:#8e98b8}
+.orbit-empty{position:absolute;left:0;right:0;bottom:22px;text-align:center;font-size:12px!important;color:#8e98b8!important;pointer-events:none}
+.orbit-fallback{color:#8e98b8!important}
+
+@media(max-width:900px){.overview-grid .orbit-panel{grid-column:1/-1}.orbit-legend{justify-content:flex-start}}
+@media(max-width:600px){.orbit-canvas{height:280px}.overview-grid{grid-template-columns:1fr}}
+
+@media (prefers-reduced-motion: reduce){
+  .live i,.orbit-loading{animation:none}
+  .btn-ripple{display:none}
+  .memory-list li button:hover{transform:none}
+}
+.modal .type-pill{align-self:flex-start}
+.overlay{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}

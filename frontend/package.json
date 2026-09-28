@@ -11,8 +11,11 @@
     "test": "vitest run --environment jsdom"
   },
   "dependencies": {
+    "@react-three/fiber": "^8.18.0",
+    "framer-motion": "^11.18.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
@@ -20,6 +23,7 @@
     "@testing-library/user-event": "^14.6.1",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "@types/three": "^0.186.0",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^5.2.0",
     "jsdom": "^26.1.0",
