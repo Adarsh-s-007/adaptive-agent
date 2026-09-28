@@ -1,0 +1,11 @@
+.hero-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.error-actions { display: flex; gap: 12px; align-items: center; }
+.error-actions button:first-child { border: 1px solid #b35a78; border-radius: 6px; padding: 5px 9px; background: #61283c; color: #fff; font-size: 12px; }
+.notice { margin: 12px 0; border: 1px solid #376e5d; border-radius: 9px; background: #123c32; color: #b5f2d7; padding: 11px 14px; font-size: 13px; }
+.live.setup i { background: #eab96a; box-shadow: 0 0 12px #eab96a; }
+.modal-error { border: 1px solid #963a5c; border-radius: 7px; background: #3b1b2b; color: #ffc6d7; padding: 10px; margin: 0; font-size: 12px; }
+.example-button { align-self: flex-start; padding: 7px 9px; border: 1px solid #494681; border-radius: 6px; background: #23244a; color: #c9c3ff; font-size: 11px; }
+.memory details { margin-top: 9px; color: #99a4c3; font-size: 11px; }
+.memory summary { cursor: pointer; }
+.memory details p { white-space: pre-wrap; padding: 8px; background: #11172b; font-size: 11px; }
+@media (max-width: 750px) { .hero-actions { width: 100%; } .hero-actions button { flex: 1; } }

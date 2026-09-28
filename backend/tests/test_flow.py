@@ -1,0 +1,251 @@
+"""ProjectPulse contract and end-to-end API tests with provider boundaries stubbed."""
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+_test_dir = tempfile.TemporaryDirectory()
+os.environ["DATABASE_URL"] = "sqlite:///" + str(
+    Path(_test_dir.name) / "projectpulse-test.db"
+)
+os.environ["HINDSIGHT_API_KEY"] = "test-hindsight-key"
+os.environ["GROQ_API_KEY"] = "test-groq-key"
+
+from fastapi.testclient import TestClient
+
+from app.api import routes
+from app.db.database import engine
+from app.main import app
+from app.services.groq_service import GroqService
+from app.services.hindsight_service import HindsightService
+
+
+class FakeHindsight:
+    def __init__(self):
+        self.banks = {}
+        self.recall_calls = []
+
+    bank_slug = staticmethod(HindsightService.bank_slug)
+
+    async def create_bank(self, bank_id, name, description):
+        self.banks[bank_id] = []
+        return {"bank_id": bank_id}
+
+    async def retain(self, bank_id, *, content, document_id, metadata, tags):
+        self.banks[bank_id].append(
+            {
+                "content": content,
+                "document_id": document_id,
+                "metadata": metadata,
+                "tags": tags,
+            }
+        )
+        return {"success": True, "items_count": 1}
+
+    async def retain_batch(self, bank_id, items):
+        for item in items:
+            self.banks[bank_id] = [
+                old
+                for old in self.banks[bank_id]
+                if old["document_id"] != item["document_id"]
+            ]
+            self.banks[bank_id].append(item)
+        return {"success": True, "items_count": len(items)}
+
+    async def recall(self, bank_id, project_id, query, limit):
+        self.recall_calls.append((bank_id, project_id, query))
+        return [
+            {
+                "id": item["document_id"],
+                "text": item["content"].split("Decision / learning: ")[-1],
+                "type": "world",
+                "metadata": item["metadata"],
+                "document_id": item["document_id"],
+                "source_text": item["content"],
+                "timestamp": "2026-09-28T10:00:00Z",
+                "why_relevant": None,
+            }
+            for item in self.banks[bank_id][:limit]
+        ]
+
+
+class FakeGroq:
+    async def select_relevant(self, task, memories):
+        words = task.lower()
+        if "login" in words or "authentication" in words:
+            return [
+                {**item, "why_relevant": "The task implements authentication."}
+                for item in memories
+                if "JWT refresh tokens" in item["text"]
+            ]
+        return []
+
+    async def answer(self, prompt, *, memory_aware=False):
+        if memory_aware:
+            return "Use HTTP-only cookies for JWT refresh tokens; avoid localStorage."
+        return "Build a login form, validate credentials, and handle errors."
+
+
+class FlowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old_hindsight = routes.hindsight
+        cls.old_groq = routes.groq
+        cls.fake_hindsight = FakeHindsight()
+        routes.hindsight = cls.fake_hindsight
+        routes.groq = FakeGroq()
+        cls.client = TestClient(app)
+
+    @classmethod
+    def tearDownClass(cls):
+        routes.hindsight = cls.old_hindsight
+        routes.groq = cls.old_groq
+        cls.client.close()
+        engine.dispose()
+        _test_dir.cleanup()
+
+    def test_fresh_agent_recall_and_bank_isolation(self):
+        ecom_response = self.client.post(
+            "/projects",
+            json={"name": "E-commerce Platform", "description": "Storefront demo"},
+        )
+        self.assertEqual(ecom_response.status_code, 201, ecom_response.text)
+        ecom = ecom_response.json()
+
+        seed = self.client.post(f"/projects/{ecom['id']}/seed-demo-data")
+        self.assertEqual(seed.status_code, 200, seed.text)
+        self.assertEqual(seed.json()["seeded"], 8)
+        self.assertEqual(
+            self.client.post(f"/projects/{ecom['id']}/seed-demo-data").json()["seeded"],
+            0,
+        )
+        self.assertEqual(len(self.fake_hindsight.banks[ecom["hindsight_bank_id"]]), 8)
+
+        retained = self.client.post(
+            f"/projects/{ecom['id']}/memories",
+            json={
+                "memory_type": "coding convention",
+                "source_agent": "Agent A",
+                "content": "Use one consistent field-error shape in checkout forms.",
+            },
+        )
+        self.assertEqual(retained.status_code, 201, retained.text)
+        self.assertEqual(retained.json()["event"]["agent_name"], "Agent A")
+        self.assertEqual(
+            self.client.get(f"/projects/{ecom['id']}/stats").json()["retained"], 9
+        )
+
+        auth = self.client.post(
+            f"/projects/{ecom['id']}/agent-answer",
+            json={
+                "agent_name": "Agent B - fresh session",
+                "task": "Build login authentication",
+            },
+        )
+        self.assertEqual(auth.status_code, 200, auth.text)
+        answer = auth.json()
+        self.assertEqual(len(answer["memories"]), 1)
+        self.assertIn("HTTP-only cookies", answer["memory_aware_answer"])
+        self.assertNotIn("HTTP-only cookies", answer["generic_answer"])
+        self.assertEqual(answer["used_bank_id"], ecom["hindsight_bank_id"])
+        self.assertEqual(answer["session"]["agent_name"], "Agent B - fresh session")
+        self.assertEqual(
+            json.loads(answer["event"]["hindsight_memory_reference"]),
+            ["seed-jwt-cookie-rule"],
+        )
+        self.assertEqual(
+            self.fake_hindsight.recall_calls[-1][0], ecom["hindsight_bank_id"]
+        )
+
+        unrelated = self.client.post(
+            f"/projects/{ecom['id']}/agent-answer",
+            json={"task": "Improve footer typography and keyboard focus"},
+        )
+        self.assertEqual(unrelated.status_code, 200, unrelated.text)
+        self.assertEqual(unrelated.json()["memories"], [])
+        self.assertEqual(
+            unrelated.json()["generic_answer"],
+            unrelated.json()["memory_aware_answer"],
+        )
+
+        second = self.client.post(
+            "/projects", json={"name": "Inventory Tool", "description": "Warehouse"}
+        ).json()
+        self.assertNotEqual(second["hindsight_bank_id"], ecom["hindsight_bank_id"])
+        second_answer = self.client.post(
+            f"/projects/{second['id']}/agent-answer",
+            json={"task": "Build login authentication"},
+        )
+        self.assertEqual(second_answer.status_code, 200, second_answer.text)
+        self.assertEqual(second_answer.json()["memories"], [])
+        self.assertEqual(
+            self.fake_hindsight.recall_calls[-1][0], second["hindsight_bank_id"]
+        )
+        self.assertEqual(
+            self.client.post(f"/projects/{second['id']}/seed-demo-data").status_code,
+            400,
+        )
+        self.assertGreaterEqual(
+            len(self.client.get(f"/projects/{ecom['id']}/timeline").json()),
+            11,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/projects/{ecom['id']}/agent-answer", json={"task": "   "}
+            ).status_code,
+            422,
+        )
+        self.assertEqual(self.client.get("/projects/not-a-uuid").status_code, 422)
+
+
+class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hindsight_recall_uses_current_schema_and_provenance(self):
+        service = HindsightService()
+        service._request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "id": "fact-1",
+                        "text": "Refresh tokens belong in HTTP-only cookies.",
+                        "type": "world",
+                        "chunk_id": "chunk-1",
+                        "metadata": {
+                            "memory_type": "architecture decision",
+                            "source_agent": "Agent A",
+                        },
+                        "mentioned_at": "2026-09-28T10:00:00Z",
+                        "scores": {"final": 0.42},
+                    }
+                ],
+                "chunks": {
+                    "chunk-1": {"text": "Never use localStorage for refresh tokens."}
+                },
+            }
+        )
+        memories = await service.recall("bank-1", "project-1", "Build login", 5)
+        payload = service._request.await_args.args[2]
+        self.assertEqual(payload["tags"], ["project:project-1"])
+        self.assertEqual(payload["tags_match"], "any_strict")
+        self.assertIn("max_tokens", payload)
+        self.assertIn("chunks", payload["include"])
+        self.assertNotIn("max_results", payload)
+        self.assertEqual(
+            memories[0]["source_text"], "Never use localStorage for refresh tokens."
+        )
+        self.assertEqual(memories[0]["timestamp"], "2026-09-28T10:00:00Z")
+
+    async def test_groq_selector_can_abstain(self):
+        service = GroqService()
+        service._complete = AsyncMock(return_value='{"selected":[]}')
+        selected = await service.select_relevant(
+            "Improve footer typography",
+            [{"id": "payment", "text": "Payment pool exhaustion", "source_text": ""}],
+        )
+        self.assertEqual(selected, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
