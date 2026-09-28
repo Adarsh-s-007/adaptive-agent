@@ -10,9 +10,9 @@ header{position:relative}
 .panel,.feature-strip,.proof-panel,.memory-list li button,.audit-mini,.setup-footer{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 .panel{background:#101527e6}
 .panel.emphasis{background:linear-gradient(145deg,#1d2045eb,#11172ee6)}
-.memory-list li button{background:#111629e6;border-left:3px solid #8574ff;transition:border-color .2s,background .2s,transform .2s,box-shadow .2s}
+.memory-list li button{background:#111629e6;border-left:3px solid #8574ff;transition:border-color .35s cubic-bezier(.22,1,.36,1),background .35s,transform .35s cubic-bezier(.22,1,.36,1),box-shadow .35s}
 .memory-list li button:hover{transform:translateX(3px);box-shadow:0 10px 30px #0006}
-.panel{transition:border-color .25s,box-shadow .25s}
+.panel{transition:border-color .4s cubic-bezier(.22,1,.36,1),box-shadow .4s cubic-bezier(.22,1,.36,1)}
 .panel:hover{border-color:#5b58a8;box-shadow:0 18px 44px #0007,0 0 0 1px #7c6cf522}
 
 /* Tabs: animated gradient underline (framer layoutId) replaces the static border. */
@@ -21,7 +21,7 @@ header{position:relative}
 .tab-underline{position:absolute;left:10px;right:10px;bottom:-1px;height:2px;border-radius:2px;background:linear-gradient(90deg,#8f80ff,#52d9ca);box-shadow:0 0 12px #8f80ffaa}
 
 /* Button ink ripple */
-button{position:relative;overflow:hidden;isolation:isolate;transition:filter .2s,transform .15s,border-color .2s,background .2s}
+button{position:relative;overflow:hidden;isolation:isolate;transition:filter .3s cubic-bezier(.22,1,.36,1),transform .25s cubic-bezier(.22,1,.36,1),border-color .3s,background .3s,color .3s}
 button.close{position:absolute}
 button:active:not(:disabled){transform:scale(.98)}
 .btn-ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,#ffffff55 0,#ffffff22 40%,transparent 70%);transform:scale(0);animation:btn-ripple .65s cubic-bezier(.22,1,.36,1) forwards;z-index:-1}
@@ -44,16 +44,22 @@ button:disabled{opacity:.6;cursor:progress}
 .orbit-head>div{max-width:560px}
 .orbit-head h2{margin-bottom:6px!important}
 .orbit-legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;max-width:520px}
-.orbit-legend li{display:flex;align-items:center;gap:7px;font-size:11px;color:#b9c1db;border:1px solid #2d3456;background:#0b1022cc;border-radius:99px;padding:5px 10px}
+.orbit-legend li{display:flex;align-items:center;gap:7px;font-size:11px;color:#b9c1db}
+.orbit-legend .recalled-legend,.orbit-legend .muted-legend{border:1px solid #2d3456;background:#0b1022cc;border-radius:99px;padding:5px 10px}
+.legend-chip{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:600;color:#b9c1db;border:1px solid #2d3456;background:#0b1022cc;border-radius:99px;padding:5px 11px;transition:border-color .35s cubic-bezier(.22,1,.36,1),background .35s,opacity .35s,transform .35s cubic-bezier(.22,1,.36,1)}
+.legend-chip:hover,.legend-chip.active{border-color:#6c64c4;background:#1a1d42;color:#eef0ff;transform:translateY(-1px)}
+.legend-chip.dimmed{opacity:.45}
+.legend-chip[aria-pressed=true]{box-shadow:0 0 0 1px #8f80ff66,0 0 18px #8f80ff33}
 .orbit-legend li i{width:8px;height:8px;border-radius:99px;display:inline-block}
 .orbit-legend li b{font-family:'DM Mono',monospace;font-weight:500;color:#eef0ff}
 .orbit-legend .recalled-legend i{background:transparent;border:2px solid #fff;box-shadow:0 0 8px #fff}
 .orbit-legend .muted-legend{color:#7f89a8}
-.orbit-canvas{position:relative;height:340px;margin:4px -23px 0;cursor:grab}
-.orbit-canvas:active{cursor:grabbing}
+.orbit-canvas{position:relative;height:380px;margin:4px -23px 0;cursor:grab;touch-action:pan-y;user-select:none}
+.orbit-canvas.dragging{cursor:grabbing}
+.orbit-hint{position:absolute;right:22px;bottom:14px;margin:0!important;font-family:'DM Mono',monospace;font-size:10px!important;letter-spacing:.08em;color:#6f7897!important;pointer-events:none}
 .orbit-loading{background:radial-gradient(circle at 50% 50%,#2a2466 0,transparent 30%);animation:orbit-load 1.4s ease-in-out infinite}
 @keyframes orbit-load{50%{opacity:.4}}
-.orbit-tooltip{position:absolute;pointer-events:none;transform:translate(14px,-50%);width:min(300px,60%);background:#141a33f2;border:1px solid #4c4a86;border-radius:10px;padding:11px 13px;box-shadow:0 18px 40px #000a;z-index:2;backdrop-filter:blur(8px)}
+.orbit-tooltip{position:absolute;left:0;top:0;margin:-42px 0 0 18px;pointer-events:none;width:min(300px,60%);background:#141a33f2;border:1px solid #4c4a86;border-radius:10px;padding:11px 13px;box-shadow:0 18px 40px #000a;z-index:2;backdrop-filter:blur(8px)}
 .orbit-tooltip span{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
 .orbit-tooltip p{margin:6px 0!important;color:#e6e9fb!important;font-size:12px!important;line-height:1.5!important}
 .orbit-tooltip small{font-size:10px;color:#8e98b8}
@@ -61,7 +67,7 @@ button:disabled{opacity:.6;cursor:progress}
 .orbit-fallback{color:#8e98b8!important}
 
 @media(max-width:900px){.overview-grid .orbit-panel{grid-column:1/-1}.orbit-legend{justify-content:flex-start}}
-@media(max-width:600px){.orbit-canvas{height:280px}.overview-grid{grid-template-columns:1fr}}
+@media(max-width:600px){.orbit-canvas{height:300px}.overview-grid{grid-template-columns:1fr}}
 
 @media (prefers-reduced-motion: reduce){
   .live i,.orbit-loading{animation:none}
@@ -70,3 +76,20 @@ button:disabled{opacity:.6;cursor:progress}
 }
 .modal .type-pill{align-self:flex-start}
 .overlay{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+
+/* 3D brand crystal + health beacon render in the WebGL layer; hide the flat versions underneath. */
+.scene-3d .logo{background:transparent!important;box-shadow:none!important;color:transparent!important}
+.scene-3d .live i{background:transparent!important;box-shadow:none!important;animation:none!important}
+
+/* Retain flight */
+.flight-layer{position:fixed;inset:0;pointer-events:none;z-index:30}
+.flight-orb{position:absolute;left:0;top:0;border-radius:50%;background:radial-gradient(circle,#fff 0,var(--orb) 45%,transparent 72%);box-shadow:0 0 14px var(--orb),0 0 32px var(--orb);will-change:transform,opacity}
+.flight-orb.head{background:radial-gradient(circle,#fff 0,#fff 22%,var(--orb) 55%,transparent 75%);box-shadow:0 0 18px var(--orb),0 0 46px var(--orb),0 0 90px var(--orb)}
+.flight-burst{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;border:2px solid var(--orb);box-shadow:0 0 24px var(--orb),inset 0 0 18px var(--orb)}
+.memory-list li.retain-landed button{animation:retain-landed 1.5s cubic-bezier(.22,1,.36,1)}
+@keyframes retain-landed{0%{box-shadow:0 0 0 0 transparent}18%{box-shadow:0 0 0 2px var(--land-color),0 0 42px var(--land-color);border-color:var(--land-color)}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion: reduce){.flight-layer{display:none}}
+/* The constellation canvas is opaque (for bloom); fade its edges into the panel. */
+.orbit-canvas canvas{-webkit-mask-image:radial-gradient(ellipse 72% 78% at 50% 50%,#000 58%,transparent 100%);mask-image:radial-gradient(ellipse 72% 78% at 50% 50%,#000 58%,transparent 100%)}
+/* Tall modals on short screens: let the overlay scroll instead of clipping the form. */
+.overlay{overflow-y:auto;align-items:safe center}

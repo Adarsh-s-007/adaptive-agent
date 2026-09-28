@@ -24,6 +24,8 @@ import {
   useButtonRipples,
 } from "./motion";
 import { hasWebGL, memoryColor, MEMORY_TYPES } from "./three/support";
+import { emitScene, HealthState } from "./three/bus";
+import { Flight, RetainFlights } from "./RetainFlight";
 
 // three.js is only downloaded when the browser can actually render it.
 const SceneBackground = lazy(() => import("./three/SceneBackground"));
@@ -78,6 +80,12 @@ export default function App() {
   const [retry, setRetry] = useState<(() => void) | null>(null);
   const [demoResult, setDemoResult] = useState<McpDemo | null>(null);
   const webgl = useMemo(hasWebGL, []);
+  const [legendHover, setLegendHover] = useState<string | null>(null);
+  const [legendPinned, setLegendPinned] = useState<string | null>(null);
+  const focusType = legendHover || legendPinned;
+  const [hoverType, setHoverType] = useState<string | null>(null);
+  const [apiOnline, setApiOnline] = useState<boolean | null>(null);
+  const [flights, setFlights] = useState<Flight[]>([]);
   useButtonRipples();
 
   async function loadProject(next: Project) {
@@ -110,7 +118,9 @@ export default function App() {
   }
 
   useEffect(() => {
-    void api.health().then(setHealth).catch(() => setHealth(null));
+    void api.health()
+      .then((next) => { setHealth(next); setApiOnline(true); })
+      .catch(() => { setHealth(null); setApiOnline(false); });
     void api.projects()
       .then(async (list) => {
         setProjects(list);
@@ -128,7 +138,7 @@ export default function App() {
     void perform("refresh", () => loadProject(next));
   }
 
-  function launchDemo() {
+  function launchDemo(origin?: Element) {
     void perform("demo", async () => {
       const latest = await api.projects();
       let demo = latest.find((item) => item.name === "E-commerce Platform");
@@ -148,6 +158,7 @@ export default function App() {
           ? "Agent A retained " + result.seeded + " sample engineering memories. " + result.mode_label
           : "The E-commerce memory bank is ready. " + result.mode_label
       );
+      waveFrom(origin, "#8d7cff");
     });
   }
 
@@ -166,10 +177,10 @@ export default function App() {
     });
   }
 
-  function retainMemory(data: MemoryForm) {
+  function retainMemory(data: MemoryForm, origin?: DOMRect) {
     if (!project) return;
     void perform("retain", async () => {
-      await api.retain(project.id, data);
+      const saved = await api.retain(project.id, data);
       await loadProject(project);
       setModal(null);
       setTab("timeline");
@@ -178,10 +189,57 @@ export default function App() {
           ? "Memory saved in Demo mode - local sample memory."
           : "Memory retained through Hindsight."
       );
+      if (origin) launchRetainFlight(origin, saved?.memory?.id, memoryColor(data.memory_type));
     });
   }
 
-  function runMcpDemo() {
+  /** Flies a glowing orb from the submit button into the newly retained memory card. */
+  function launchRetainFlight(origin: DOMRect, memoryId: string | undefined, color: string) {
+    const from = { x: origin.left + origin.width / 2, y: origin.top + origin.height / 2 };
+    emitScene({ type: "ripple", x: from.x, y: from.y, color, strength: 1.1 });
+    // Wait for the timeline to render the new card before measuring where to land.
+    window.setTimeout(() => {
+      const byId = memoryId
+        ? document.querySelector('[data-memory-id="' + memoryId.replace(/"/g, "") + '"]')
+        : null;
+      const target = byId || document.querySelector(".memory-list li") ||
+        document.querySelector('[data-tab="timeline"]');
+      if (!target) return;
+      const initial = target.getBoundingClientRect();
+      const offscreen = initial.top < 60 || initial.bottom > window.innerHeight - 20;
+      // Bring the new card on screen first so the orb has somewhere visible to land.
+      if (offscreen) target.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      window.setTimeout(() => fly(target), offscreen ? 550 : 0);
+    }, 120);
+
+    function fly(target: Element) {
+      const rect = target.getBoundingClientRect();
+      const to = { x: rect.left + Math.min(rect.width / 2, 120), y: rect.top + Math.min(rect.height / 2, 40) };
+      const id = Date.now();
+      setFlights((current) => [...current, {
+        id, from, to, color,
+        onLand: () => {
+          emitScene({ type: "ripple", x: to.x, y: to.y, color, strength: 1.4 });
+          const landed = (target.closest("li") || target) as HTMLElement;
+          landed.style.setProperty("--land-color", color);
+          landed.classList.add("retain-landed");
+          window.setTimeout(() => landed.classList.remove("retain-landed"), 1600);
+        },
+      }]);
+    }
+  }
+
+  function waveFrom(origin: Element | undefined, color: string) {
+    const rect = origin?.isConnected ? origin.getBoundingClientRect() : null;
+    emitScene({
+      type: "wave",
+      x: rect ? rect.left + rect.width / 2 : window.innerWidth / 2,
+      y: rect ? rect.top + rect.height / 2 : window.innerHeight / 3,
+      color,
+    });
+  }
+
+  function runMcpDemo(origin?: Element) {
     if (!project) return;
     void perform("mcp", async () => {
       const result = await api.runMcpDemo(project.id);
@@ -189,6 +247,7 @@ export default function App() {
       await loadProject(project);
       setTab("activity");
       setNotice("The official MCP client called recall_project_memory and logged the result.");
+      waveFrom(origin, "#52d9ca");
     });
   }
 
@@ -230,6 +289,16 @@ export default function App() {
         ? "Hindsight connected"
         : "Demo mode";
   const isDemo = project?.memory_mode === "demo" || !health?.hindsight_configured;
+  const healthState: HealthState = apiOnline === false
+    ? "offline"
+    : !health ? "unknown" : isDemo ? "demo" : "connected";
+  const tintType = hoverType || selectedMemory?.type || focusType;
+
+  useEffect(() => { emitScene({ type: "health", value: healthState }); }, [healthState]);
+  useEffect(() => { emitScene({ type: "busy", value: !!busy }); }, [busy]);
+  useEffect(() => {
+    emitScene({ type: "tint", color: tintType ? memoryColor(tintType) : null });
+  }, [tintType]);
   const instructionSnippet =
     "ProjectPulse project ID: " + (project?.id || "<PROJECT_ID>") + "\n\n" +
     "Before implementing a coding task, call recall_project_memory with the task description and follow relevant returned memories.\n" +
@@ -267,7 +336,9 @@ export default function App() {
         <div className="brand">
           <motion.span
             className="logo"
+            data-anchor="brand"
             whileHover={{ rotate: 180, scale: 1.12 }}
+            onHoverStart={() => emitScene({ type: "logo-hover" })}
             transition={{ type: "spring", stiffness: 260, damping: 16 }}
           >{"\u2726"}</motion.span>
           <span>Project<span>Pulse</span></span>
@@ -275,7 +346,7 @@ export default function App() {
         </div>
         <div className="head-actions">
           <span className={"live " + (isDemo ? "setup" : "")}>
-            <i /> {status.toUpperCase()}
+            <i data-anchor="beacon" /> {status.toUpperCase()}
           </span>
           <button className="ghost" onClick={() => setModal("project")}>+ New project</button>
         </div>
@@ -304,7 +375,7 @@ export default function App() {
             <code>{project.hindsight_bank_id}</code>
           </div>
         ) : (
-          <button className="primary" onClick={launchDemo} disabled={!!busy}>
+          <button className="primary" onClick={(event) => launchDemo(event.currentTarget)} disabled={!!busy}>
             {busy === "demo" ? "Preparing demo..." : "Launch E-commerce MCP demo"}
           </button>
         )}
@@ -344,7 +415,7 @@ export default function App() {
             New sessions recall the decisions that matter before they write code.
           </motion.p>
           <motion.div className="landing-actions" variants={rise}>
-            <motion.button className="primary big" onClick={launchDemo} disabled={!!busy}
+            <motion.button className="primary big" onClick={(event) => launchDemo(event.currentTarget)} disabled={!!busy}
               whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
               {busy === "demo" ? "Preparing demo..." : "Launch E-commerce MCP demo"}
             </motion.button>
@@ -373,7 +444,7 @@ export default function App() {
             </div>
             <div className="hero-actions">
               {project.name === "E-commerce Platform" && (
-                <button className="ghost" onClick={launchDemo} disabled={!!busy}>
+                <button className="ghost" onClick={(event) => launchDemo(event.currentTarget)} disabled={!!busy}>
                   {busy === "demo" ? "Seeding..." : "Seed demo data"}
                 </button>
               )}
@@ -392,6 +463,7 @@ export default function App() {
             ] as [Tab, string][]).map(([key, label]) => (
               <button
                 key={key}
+                data-tab={key}
                 className={tab === key ? "active" : ""}
                 onClick={() => setTab(key)}
               >
@@ -440,14 +512,27 @@ export default function App() {
                       <h2>Project knowledge in orbit</h2>
                       <p>
                         Each node is a retained memory orbiting this project's bank, grouped by type.
-                        Recalled evidence pulses. Hover a node to read it, click to inspect.
+                        Recalled evidence streams into the core. Hover a type to spotlight it, drag to rotate,
+                        and click a node to inspect it.
                       </p>
                     </div>
                     <ul className="orbit-legend" aria-label="Memory types">
                       {typeCounts.length ? typeCounts.map(([type, count]) => (
                         <li key={type}>
-                          <i style={{ background: memoryColor(type), boxShadow: "0 0 10px " + memoryColor(type) }} />
-                          {kindLabel(type)} <b>{count}</b>
+                          <button
+                            type="button"
+                            className={"legend-chip" + (focusType === type ? " active" : "") +
+                              (focusType && focusType !== type ? " dimmed" : "")}
+                            aria-pressed={legendPinned === type}
+                            onMouseEnter={() => setLegendHover(type)}
+                            onMouseLeave={() => setLegendHover(null)}
+                            onFocus={() => setLegendHover(type)}
+                            onBlur={() => setLegendHover(null)}
+                            onClick={() => setLegendPinned((current) => current === type ? null : type)}
+                          >
+                            <i style={{ background: memoryColor(type), boxShadow: "0 0 10px " + memoryColor(type) }} />
+                            {kindLabel(type)} <b>{count}</b>
+                          </button>
                         </li>
                       )) : <li className="muted-legend">No memories retained yet</li>}
                       {recalledIds.size > 0 && <li className="recalled-legend"><i /> Recalled by Agent B</li>}
@@ -455,7 +540,8 @@ export default function App() {
                   </div>
                   {webgl ? (
                     <Suspense fallback={<div className="orbit-canvas orbit-loading" />}>
-                      <MemoryOrbit memories={memories} highlighted={recalledIds} onSelect={setSelectedMemory} />
+                      <MemoryOrbit memories={memories} highlighted={recalledIds} onSelect={setSelectedMemory}
+                        focusType={focusType} />
                     </Suspense>
                   ) : (
                     <p className="orbit-fallback">3D view needs WebGL, which this browser doesn't provide.</p>
@@ -476,7 +562,7 @@ export default function App() {
                     <code> recall_project_memory</code>, and this dashboard shows the exact evidence.
                   </p>
                 </div>
-                <button className="primary" onClick={runMcpDemo} disabled={!!busy}>
+                <button className="primary" onClick={(event) => runMcpDemo(event.currentTarget)} disabled={!!busy}>
                   {busy === "mcp" ? "Calling MCP tool..." : "Run fresh Agent B MCP demo"}
                 </button>
               </motion.div>
@@ -517,9 +603,11 @@ export default function App() {
               {filteredMemories.length ? (
                 <ol className="memory-list">
                   {filteredMemories.map((memory, index) => (
-                    <motion.li key={memory.id} layout="position" {...listItem(index)}>
+                    <motion.li key={memory.id} data-memory-id={memory.id} layout="position" {...listItem(index)}>
                       <button
                         onClick={() => setSelectedMemory(memory)}
+                        onMouseEnter={() => setHoverType(memory.type)}
+                        onMouseLeave={() => setHoverType(null)}
                         style={{ borderLeftColor: memoryColor(memory.type) }}
                       >
                         <div className="memory-list-head">
@@ -570,7 +658,7 @@ export default function App() {
                 </div>
                 <div className="hero-actions">
                   <button className="ghost" onClick={() => void perform("refresh", () => loadProject(project))}>Refresh</button>
-                  <button className="primary" onClick={runMcpDemo} disabled={!!busy}>
+                  <button className="primary" onClick={(event) => runMcpDemo(event.currentTarget)} disabled={!!busy}>
                     {busy === "mcp" ? "Calling MCP..." : "Run fresh Agent B MCP demo"}
                   </button>
                 </div>
@@ -686,6 +774,11 @@ export default function App() {
         </>
       )}
 
+      <RetainFlights
+        flights={flights}
+        onDone={(id) => setFlights((current) => current.filter((flight) => flight.id !== id))}
+      />
+
       <AnimatePresence>
         {modal === "project" && <ProjectModal
           key="project-modal"
@@ -749,7 +842,7 @@ function MemoryModal({
   close, save, saving, error, showExample, demo,
 }: {
   close: () => void;
-  save: (data: MemoryForm) => void;
+  save: (data: MemoryForm, origin?: DOMRect) => void;
   saving: boolean;
   error: string;
   showExample: boolean;
@@ -760,12 +853,14 @@ function MemoryModal({
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const submitter = (event.nativeEvent as SubmitEvent).submitter ||
+      event.currentTarget.querySelector("button.primary");
     save({
       memory_type: kind,
       source_agent: String(form.get("agent") || ""),
       content,
       tags: String(form.get("tags") || "").split(",").map((tag) => tag.trim()).filter(Boolean),
-    });
+    }, submitter?.getBoundingClientRect());
   };
   return <motion.div className="overlay" {...overlayMotion}>
     <motion.form className="modal" onSubmit={submit} {...modalMotion}>

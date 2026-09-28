@@ -1,152 +1,182 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Bloom, EffectComposer } from "@react-three/postprocessing";
 import * as THREE from "three";
 
+import { HealthState, onScene } from "./bus";
 import { prefersReducedMotion } from "./support";
 
 /*
- * Full-viewport decorative layer that sits behind the dashboard:
- *  - a tilted point field that ripples wherever the user clicks (plus soft ambient ripples)
- *  - small agent models that travel left -> right along horizontal lanes the DOM leaves empty,
- *    fading out whenever they would pass behind real content.
+ * Full-viewport WebGL layer behind the dashboard (opaque, so bloom can glow over it):
+ *  - backdrop gradient (replaces the CSS body gradient) that tints toward the data in focus
+ *  - a dense, misty field of tiny orbs: cursor wake, click ripples, colored data ripples/waves
+ *  - the 3D brand crystal and the health beacon, pinned over their header elements
  */
 
-const RIPPLE_SLOTS = 8;
-const RIPPLE_LIFETIME = 4.2;
-const FIELD_COLS = 200;
-const FIELD_ROWS = 125;
-const FIELD_W = 80;
-const FIELD_H = 50;
+const RIPPLE_SLOTS = 16;
+const RIPPLE_LIFETIME = 3.6;
+const FIELD_COLS = 300;
+const FIELD_ROWS = 190;
+const FIELD_W = 64;
+const FIELD_H = 40;
+const MIST_COUNT = 160;
 
-const OBSTACLE_SELECTOR = [
-  "header .brand", "header .head-actions", ".topbar > *", ".hero > *", ".empty > *",
-  ".landing-actions > *", ".section-nav", ".panel", ".feature-strip", ".section-title",
-  ".filter-row", ".memory-list li", ".empty-panel", ".audit-mini", ".activity-item",
-  ".proof-panel", ".setup-footer", ".error", ".notice", ".overlay",
-].join(",");
-const OBSTACLE_PAD = 14;
+const HOVER_MIN_DISTANCE = 64;
+const HOVER_MIN_INTERVAL = 0.09;
+const HOVER_STRENGTH = 0.45;
+const CLICK_STRENGTH = 1;
+const DEFAULT_RIPPLE = "#c9c2ff";
 
-type Rect = { left: number; top: number; right: number; bottom: number };
+const HEALTH_COLORS: Record<HealthState, string> = {
+  connected: "#4be0af",
+  demo: "#eab96a",
+  offline: "#ff6b7d",
+  unknown: "#8790ae",
+};
+
+// Shared scene state written by bus events, read inside frame loops.
+type SceneState = {
+  tint: THREE.Color;
+  tintTarget: number;
+  flash: THREE.Color;
+  flashAmount: number;
+  busy: boolean;
+  health: HealthState;
+  logoKick: number;
+};
 
 // ---------------------------------------------------------------------------
-// DOM obstacle tracking (screen-space rects of real content)
+// Backdrop
 // ---------------------------------------------------------------------------
 
-function useObstacles() {
-  const rects = useRef<Rect[]>([]);
-  useEffect(() => {
-    let frame = 0;
-    const measure = () => {
-      frame = 0;
-      const height = window.innerHeight;
-      const next: Rect[] = [];
-      document.querySelectorAll(OBSTACLE_SELECTOR).forEach((element) => {
-        const box = element.getBoundingClientRect();
-        if (!box.width || !box.height || box.bottom < 0 || box.top > height) return;
-        next.push({
-          left: box.left - OBSTACLE_PAD,
-          top: box.top - OBSTACLE_PAD,
-          right: box.right + OBSTACLE_PAD,
-          bottom: box.bottom + OBSTACLE_PAD,
-        });
-      });
-      rects.current = next;
-    };
-    const schedule = () => { if (!frame) frame = requestAnimationFrame(measure); };
-    measure();
-    const interval = window.setInterval(schedule, 350);
-    window.addEventListener("scroll", schedule, { passive: true });
-    window.addEventListener("resize", schedule);
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("scroll", schedule);
-      window.removeEventListener("resize", schedule);
-      if (frame) cancelAnimationFrame(frame);
-    };
-  }, []);
-  return rects;
-}
-
-function overlaps(rects: Rect[], box: Rect): boolean {
-  return rects.some((rect) => rect.left < box.right && rect.right > box.left &&
-    rect.top < box.bottom && rect.bottom > box.top);
-}
-
-/** Free horizontal length (px) of a screen band after subtracting every obstacle crossing it. */
-function freeWidth(rects: Rect[], top: number, bottom: number, width: number): number {
-  const spans = rects
-    .filter((rect) => rect.top < bottom && rect.bottom > top)
-    .map((rect) => [Math.max(0, rect.left), Math.min(width, rect.right)] as const)
-    .filter(([start, end]) => end > start)
-    .sort((a, b) => a[0] - b[0]);
-  let covered = 0;
-  let cursor = 0;
-  for (const [start, end] of spans) {
-    if (end <= cursor) continue;
-    covered += end - Math.max(start, cursor);
-    cursor = end;
+const backdropVertex = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
   }
-  return width - covered;
-}
+`;
 
-class LaneRegistry {
-  private claims = new Map<number, number>();
+const backdropFragment = /* glsl */ `
+  uniform vec2 uResolution;
+  uniform vec3 uBase;
+  uniform vec3 uViolet;
+  uniform vec3 uTeal;
+  uniform vec3 uTint;
+  uniform float uTintAmount;
+  uniform vec3 uFlash;
+  uniform float uFlashAmount;
+  varying vec2 vUv;
 
-  release(id: number) { this.claims.delete(id); }
-
-  /** Picks a lane (feet y, px) with plenty of empty horizontal space, away from other agents. */
-  claim(id: number, rects: Rect[], agentHeight: number): number | null {
-    const width = window.innerWidth;
-    const height = window.innerHeight;
-    const others = [...this.claims.entries()].filter(([key]) => key !== id).map(([, y]) => y);
-    const candidates: { y: number; score: number }[] = [];
-    for (let y = 96 + agentHeight; y < height - 18; y += 14) {
-      if (others.some((other) => Math.abs(other - y) < agentHeight * 1.4)) continue;
-      const score = freeWidth(rects, y - agentHeight - 6, y + 8, width) / width;
-      if (score > 0.34) candidates.push({ y, score });
-    }
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => b.score - a.score);
-    const pool = candidates.slice(0, Math.max(3, Math.ceil(candidates.length * 0.35)));
-    const lane = pool[Math.floor(Math.random() * pool.length)].y;
-    this.claims.set(id, lane);
-    return lane;
+  // Mirrors CSS "radial-gradient(circle at X Y, color 0, transparent STOP)" (farthest-corner size).
+  float radial(vec2 center, float stop) {
+    vec2 px = vec2(vUv.x, 1.0 - vUv.y) * uResolution;
+    vec2 c = center * uResolution;
+    float far = max(max(length(c), length(c - vec2(uResolution.x, 0.0))),
+                    max(length(c - vec2(0.0, uResolution.y)), length(c - uResolution)));
+    return clamp(1.0 - length(px - c) / (far * stop), 0.0, 1.0);
   }
+
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+  void main() {
+    vec3 color = uBase;
+    color = mix(color, uTeal, radial(vec2(0.1, 1.1), 0.38));
+    color = mix(color, uViolet, radial(vec2(0.68, -0.1), 0.34));
+    color = mix(color, uTint * 0.3, radial(vec2(0.5, 1.0), 0.55) * uTintAmount * 0.3);
+    color += uFlash * radial(vec2(0.5, 0.45), 0.9) * uFlashAmount * 0.12;
+    color += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+    gl_FragColor = vec4(color, 1.0);
+    #include <colorspace_fragment>
+  }
+`;
+
+function Backdrop({ scene }: { scene: SceneState }) {
+  const { size } = useThree();
+  const uniforms = useMemo(() => ({
+    uResolution: { value: new THREE.Vector2(1, 1) },
+    uBase: { value: new THREE.Color("#080b16") },
+    uViolet: { value: new THREE.Color("#252059") },
+    uTeal: { value: new THREE.Color("#0f2d33") },
+    uTint: { value: new THREE.Color("#000000") },
+    uTintAmount: { value: 0 },
+    uFlash: { value: new THREE.Color("#000000") },
+    uFlashAmount: { value: 0 },
+  }), []);
+
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
+    uniforms.uResolution.value.set(size.width, size.height);
+    uniforms.uTint.value.lerp(scene.tint, 1 - Math.exp(-4 * delta));
+    uniforms.uTintAmount.value = THREE.MathUtils.damp(uniforms.uTintAmount.value, scene.tintTarget, 2.5, delta);
+    uniforms.uFlash.value.copy(scene.flash);
+    uniforms.uFlashAmount.value = scene.flashAmount;
+  });
+
+  return (
+    <mesh frustumCulled={false} renderOrder={-10}>
+      <planeGeometry args={[2, 2]} />
+      <shaderMaterial vertexShader={backdropVertex} fragmentShader={backdropFragment}
+        uniforms={uniforms} depthTest={false} depthWrite={false} />
+    </mesh>
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Ripple field
+// Orb field
 // ---------------------------------------------------------------------------
 
 const fieldVertex = /* glsl */ `
+  attribute float aRand;
   uniform float uTime;
   uniform float uPixelRatio;
   uniform vec4 uRipples[${RIPPLE_SLOTS}];
-  varying float vHeight;
+  uniform vec3 uRippleColors[${RIPPLE_SLOTS}];
+  uniform vec3 uPointer;
+  uniform vec3 uHighlight;
+  varying float vEnergy;
   varying float vFade;
+  varying float vTwinkle;
+  varying float vRand;
+  varying vec3 vEnergyColor;
 
   void main() {
     vec3 p = position;
-    float h = sin(p.x * 0.42 + uTime * 0.55) * 0.07 + cos(p.y * 0.5 + uTime * 0.4) * 0.07;
+    float swell = sin(p.x * 0.35 + uTime * 0.45) * 0.06 + cos(p.y * 0.42 + uTime * 0.33) * 0.06;
+    float energy = 0.0;
+    float lift = 0.0;
+    vec3 tinted = vec3(0.0);
     for (int i = 0; i < ${RIPPLE_SLOTS}; i++) {
       vec4 r = uRipples[i];
       float age = uTime - r.z;
       if (age > 0.0 && age < ${RIPPLE_LIFETIME.toFixed(1)}) {
         float d = distance(p.xy, r.xy);
-        float front = age * 3.4;
-        float band = exp(-pow((d - front) * 1.25, 2.0));
+        float front = age * 2.6;
+        float band = exp(-pow((d - front) * 0.95, 2.0));
         float life = 1.0 - age / ${RIPPLE_LIFETIME.toFixed(1)};
-        h += sin((d - front) * 4.2) * band * r.w * life * life * 0.75;
+        life *= life;
+        float e = band * r.w * life;
+        lift += sin((d - front) * 3.2) * e * 0.5;
+        energy += e;
+        tinted += uRippleColors[i] * e;
       }
     }
-    p.z += h;
-    vHeight = h;
+    float glow = exp(-pow(distance(p.xy, uPointer.xy), 2.0) / 11.0) * uPointer.z;
+    lift += glow * 0.22;
+    energy += glow * 0.85;
+    tinted += uHighlight * glow * 0.85;
+
+    p.z += swell + lift;
+    vEnergy = energy;
+    vEnergyColor = energy > 0.001 ? tinted / energy : uHighlight;
+    vRand = aRand;
+    vTwinkle = 0.65 + 0.35 * sin(uTime * (0.6 + aRand * 1.6) + aRand * 40.0);
 
     vec4 mv = modelViewMatrix * vec4(p, 1.0);
     float depth = -mv.z;
     float edge = min(1.0 - abs(position.x) / ${(FIELD_W / 2).toFixed(1)}, 1.0 - abs(position.y) / ${(FIELD_H / 2).toFixed(1)});
-    vFade = smoothstep(0.0, 0.18, edge) * smoothstep(46.0, 13.0, depth);
-    gl_PointSize = 2.7 * uPixelRatio * (12.0 / depth) * (1.0 + clamp(abs(h) * 2.4, 0.0, 1.6));
+    vFade = smoothstep(0.0, 0.22, edge) * smoothstep(40.0, 12.0, depth);
+    gl_PointSize = (1.6 + aRand * 1.9) * uPixelRatio * (12.0 / depth) * (1.0 + clamp(energy, 0.0, 1.4) * 1.1);
     gl_Position = projectionMatrix * mv;
   }
 `;
@@ -154,37 +184,89 @@ const fieldVertex = /* glsl */ `
 const fieldFragment = /* glsl */ `
   uniform vec3 uColorA;
   uniform vec3 uColorB;
-  varying float vHeight;
+  uniform vec3 uTint;
+  uniform float uTintAmount;
+  varying float vEnergy;
   varying float vFade;
+  varying float vTwinkle;
+  varying float vRand;
+  varying vec3 vEnergyColor;
 
   void main() {
     float d = length(gl_PointCoord - 0.5);
-    if (d > 0.5) discard;
-    float soft = smoothstep(0.5, 0.05, d);
-    vec3 color = mix(uColorA, uColorB, clamp(vHeight * 2.6 + 0.45, 0.0, 1.0));
-    float alpha = soft * vFade * (0.2 + clamp(abs(vHeight) * 2.0, 0.0, 0.75));
+    float soft = exp(-d * d * 14.0);
+    vec3 color = mix(uColorA, uColorB, vRand);
+    color = mix(color, uTint, uTintAmount * 0.45);
+    color = mix(color, vEnergyColor, clamp(vEnergy * 0.9, 0.0, 0.9));
+    float alpha = soft * vFade * (0.26 * vTwinkle * (1.0 + uTintAmount * 0.15) + clamp(vEnergy, 0.0, 1.2) * 0.8);
     gl_FragColor = vec4(color, alpha);
+    #include <colorspace_fragment>
   }
 `;
 
-function RippleField({ reduced }: { reduced: boolean }) {
+const mistVertex = /* glsl */ `
+  attribute float aRand;
+  uniform float uTime;
+  uniform float uPixelRatio;
+  varying float vRand;
+
+  void main() {
+    vec3 p = position;
+    p.x += sin(uTime * 0.05 + aRand * 30.0) * 1.6;
+    p.y += cos(uTime * 0.04 + aRand * 20.0) * 0.9;
+    vRand = aRand;
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = (90.0 + aRand * 160.0) * uPixelRatio * (10.0 / -mv.z);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const mistFragment = /* glsl */ `
+  uniform vec3 uColorA;
+  uniform vec3 uColorB;
+  uniform vec3 uTint;
+  uniform float uTintAmount;
+  uniform float uTime;
+  varying float vRand;
+
+  void main() {
+    float d = length(gl_PointCoord - 0.5);
+    float soft = exp(-d * d * 9.0) * smoothstep(0.5, 0.35, d);
+    float breathe = 0.7 + 0.3 * sin(uTime * 0.3 + vRand * 12.0);
+    vec3 color = mix(mix(uColorA, uColorB, vRand), uTint, uTintAmount * 0.4);
+    gl_FragColor = vec4(color, soft * 0.03 * breathe);
+    #include <colorspace_fragment>
+  }
+`;
+
+function OrbField({ reduced, scene }: { reduced: boolean; scene: SceneState }) {
   const points = useRef<THREE.Points>(null);
   const slot = useRef(0);
   const time = useRef(0);
+  const pointerTarget = useRef(new THREE.Vector3(0, 0, 0));
+  const lastActive = useRef(-10);
   const { camera } = useThree();
 
   const geometry = useMemo(() => {
-    const positions = new Float32Array(FIELD_COLS * FIELD_ROWS * 3);
-    let offset = 0;
+    const count = FIELD_COLS * FIELD_ROWS;
+    const positions = new Float32Array(count * 3);
+    const rand = new Float32Array(count);
+    const stepX = FIELD_W / FIELD_COLS;
+    const stepY = FIELD_H / FIELD_ROWS;
+    let index = 0;
     for (let row = 0; row < FIELD_ROWS; row++) {
       for (let col = 0; col < FIELD_COLS; col++) {
-        positions[offset++] = (col / (FIELD_COLS - 1) - 0.5) * FIELD_W;
-        positions[offset++] = (row / (FIELD_ROWS - 1) - 0.5) * FIELD_H;
-        positions[offset++] = 0;
+        // Jitter breaks the grid up so it reads as mist rather than a lattice.
+        positions[index * 3] = (col / (FIELD_COLS - 1) - 0.5) * FIELD_W + (Math.random() - 0.5) * stepX * 1.6;
+        positions[index * 3 + 1] = (row / (FIELD_ROWS - 1) - 0.5) * FIELD_H + (Math.random() - 0.5) * stepY * 1.6;
+        positions[index * 3 + 2] = (Math.random() - 0.5) * 0.35;
+        rand[index] = Math.random();
+        index++;
       }
     }
     const next = new THREE.BufferGeometry();
     next.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    next.setAttribute("aRand", new THREE.BufferAttribute(rand, 1));
     return next;
   }, []);
 
@@ -192,8 +274,13 @@ function RippleField({ reduced }: { reduced: boolean }) {
     uTime: { value: 0 },
     uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 1.5) },
     uRipples: { value: Array.from({ length: RIPPLE_SLOTS }, () => new THREE.Vector4(0, 0, -100, 0)) },
-    uColorA: { value: new THREE.Color("#7c6cf5") },
-    uColorB: { value: new THREE.Color("#52d9ca") },
+    uRippleColors: { value: Array.from({ length: RIPPLE_SLOTS }, () => new THREE.Color(DEFAULT_RIPPLE)) },
+    uPointer: { value: new THREE.Vector3(0, 0, 0) },
+    uHighlight: { value: new THREE.Color(DEFAULT_RIPPLE) },
+    uColorA: { value: new THREE.Color("#6f63e8") },
+    uColorB: { value: new THREE.Color("#3fb8c4") },
+    uTint: { value: new THREE.Color("#000000") },
+    uTintAmount: { value: 0 },
   }), []);
 
   useEffect(() => {
@@ -201,346 +288,350 @@ function RippleField({ reduced }: { reduced: boolean }) {
     const plane = new THREE.Plane();
     const normal = new THREE.Vector3();
     const hit = new THREE.Vector3();
+    const ndc = new THREE.Vector2();
+    let lastX = -1000;
+    let lastY = -1000;
+    let lastHoverAt = -10;
+    const timers: number[] = [];
 
-    const rippleAt = (clientX: number, clientY: number, strength: number) => {
+    const toLocal = (clientX: number, clientY: number): THREE.Vector3 | null => {
       const field = points.current;
-      if (!field) return;
-      const ndc = new THREE.Vector2(
-        (clientX / window.innerWidth) * 2 - 1,
-        -(clientY / window.innerHeight) * 2 + 1,
-      );
+      if (!field) return null;
+      ndc.set((clientX / window.innerWidth) * 2 - 1, -(clientY / window.innerHeight) * 2 + 1);
       raycaster.setFromCamera(ndc, camera);
       normal.set(0, 0, 1).transformDirection(field.matrixWorld);
       plane.setFromNormalAndCoplanarPoint(normal, field.getWorldPosition(new THREE.Vector3()));
-      if (!raycaster.ray.intersectPlane(plane, hit)) return;
-      const local = field.worldToLocal(hit.clone());
+      if (!raycaster.ray.intersectPlane(plane, hit)) return null;
+      return field.worldToLocal(hit.clone());
+    };
+
+    const ripple = (clientX: number, clientY: number, strength: number, color = DEFAULT_RIPPLE) => {
+      const local = toLocal(clientX, clientY);
+      if (!local) return;
       uniforms.uRipples.value[slot.current].set(local.x, local.y, time.current, strength);
+      uniforms.uRippleColors.value[slot.current].set(color);
       slot.current = (slot.current + 1) % RIPPLE_SLOTS;
     };
 
-    const onPointerDown = (event: PointerEvent) => rippleAt(event.clientX, event.clientY, 1);
-    window.addEventListener("pointerdown", onPointerDown, { passive: true });
-
-    const ambient = reduced ? 0 : window.setInterval(() => {
-      if (document.hidden) return;
-      rippleAt(
-        window.innerWidth * (0.1 + Math.random() * 0.8),
-        window.innerHeight * (0.35 + Math.random() * 0.6),
-        0.45 + Math.random() * 0.3,
-      );
-    }, 3400);
-
-    return () => {
-      window.removeEventListener("pointerdown", onPointerDown);
-      if (ambient) window.clearInterval(ambient);
+    const onPointerMove = (event: PointerEvent) => {
+      const local = toLocal(event.clientX, event.clientY);
+      if (!local) return;
+      pointerTarget.current.set(local.x, local.y, 1);
+      lastActive.current = time.current;
+      if (reduced) return;
+      const moved = Math.hypot(event.clientX - lastX, event.clientY - lastY);
+      if (moved > HOVER_MIN_DISTANCE && time.current - lastHoverAt > HOVER_MIN_INTERVAL) {
+        ripple(event.clientX, event.clientY, HOVER_STRENGTH);
+        lastX = event.clientX;
+        lastY = event.clientY;
+        lastHoverAt = time.current;
+      }
     };
-  }, [camera, reduced, uniforms]);
+    const onPointerDown = (event: PointerEvent) => ripple(event.clientX, event.clientY, reduced ? 0.4 : CLICK_STRENGTH);
+    const onLeave = () => { pointerTarget.current.z = 0; };
 
-  useFrame((_, delta) => {
-    time.current += Math.min(delta, 0.05) * (reduced ? 0.15 : 1);
+    const unsubscribe = onScene((event) => {
+      if (event.type === "ripple") ripple(event.x, event.y, event.strength ?? 1, event.color);
+      if (event.type === "wave") {
+        // A recall/seed wave: a strong colored ripple, two echoes, and a brief backdrop flash.
+        ripple(event.x, event.y, 1.6, event.color);
+        timers.push(window.setTimeout(() => ripple(event.x, event.y, 1.05, event.color), 240));
+        timers.push(window.setTimeout(() => ripple(event.x, event.y, 0.65, event.color), 480));
+        scene.flash.set(event.color);
+        scene.flashAmount = 1;
+      }
+    });
+
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    document.documentElement.addEventListener("pointerleave", onLeave);
+    return () => {
+      unsubscribe();
+      timers.forEach((timer) => window.clearTimeout(timer));
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerdown", onPointerDown);
+      document.documentElement.removeEventListener("pointerleave", onLeave);
+    };
+  }, [camera, reduced, scene, uniforms]);
+
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
+    time.current += delta * (reduced ? 0.2 : 1);
     uniforms.uTime.value = time.current;
+    const idle = time.current - lastActive.current > 1.4;
+    const pointer = uniforms.uPointer.value;
+    pointer.x = THREE.MathUtils.damp(pointer.x, pointerTarget.current.x, 6, delta);
+    pointer.y = THREE.MathUtils.damp(pointer.y, pointerTarget.current.y, 6, delta);
+    pointer.z = THREE.MathUtils.damp(pointer.z, idle ? 0 : pointerTarget.current.z, idle ? 1.5 : 4, delta);
+    // The cursor glow and resting orbs lean toward whatever data is in focus.
+    uniforms.uTint.value.lerp(scene.tint, 1 - Math.exp(-4 * delta));
+    uniforms.uTintAmount.value = THREE.MathUtils.damp(uniforms.uTintAmount.value, scene.tintTarget, 2.5, delta);
+    uniforms.uHighlight.value.set(DEFAULT_RIPPLE).lerp(scene.tint, uniforms.uTintAmount.value);
   });
 
   return (
     <points ref={points} geometry={geometry} position={[0, -1, -4]} rotation={[-0.78, 0, 0]}>
-      <shaderMaterial
-        vertexShader={fieldVertex}
-        fragmentShader={fieldFragment}
-        uniforms={uniforms}
-        transparent
-        depthWrite={false}
-        blending={THREE.AdditiveBlending}
-      />
+      <shaderMaterial vertexShader={fieldVertex} fragmentShader={fieldFragment} uniforms={uniforms}
+        transparent depthWrite={false} blending={THREE.AdditiveBlending} />
+    </points>
+  );
+}
+
+function Mist({ reduced, scene }: { reduced: boolean; scene: SceneState }) {
+  const geometry = useMemo(() => {
+    const positions = new Float32Array(MIST_COUNT * 3);
+    const rand = new Float32Array(MIST_COUNT);
+    for (let index = 0; index < MIST_COUNT; index++) {
+      positions.set([(Math.random() - 0.5) * 30, (Math.random() - 0.5) * 16 - 1, -2 - Math.random() * 10], index * 3);
+      rand[index] = Math.random();
+    }
+    const next = new THREE.BufferGeometry();
+    next.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    next.setAttribute("aRand", new THREE.BufferAttribute(rand, 1));
+    return next;
+  }, []);
+  const uniforms = useMemo(() => ({
+    uTime: { value: 0 },
+    uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 1.5) },
+    uColorA: { value: new THREE.Color("#7d6cf5") },
+    uColorB: { value: new THREE.Color("#3fc1c9") },
+    uTint: { value: new THREE.Color("#000000") },
+    uTintAmount: { value: 0 },
+  }), []);
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
+    uniforms.uTime.value += delta * (reduced ? 0.2 : 1);
+    uniforms.uTint.value.lerp(scene.tint, 1 - Math.exp(-4 * delta));
+    uniforms.uTintAmount.value = THREE.MathUtils.damp(uniforms.uTintAmount.value, scene.tintTarget, 2.5, delta);
+  });
+  return (
+    <points geometry={geometry}>
+      <shaderMaterial vertexShader={mistVertex} fragmentShader={mistFragment} uniforms={uniforms}
+        transparent depthWrite={false} blending={THREE.AdditiveBlending} />
     </points>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Agents
+// Objects pinned over DOM elements (brand crystal, health beacon)
 // ---------------------------------------------------------------------------
 
-type AgentKind = "walker" | "drone" | "rover";
-
-type AgentSpec = { kind: AgentKind; color: string; speed: number };
-
-const AGENT_SPECS: AgentSpec[] = [
-  { kind: "walker", color: "#8d7cff", speed: 62 },
-  { kind: "drone", color: "#52d9ca", speed: 88 },
-  { kind: "rover", color: "#eab96a", speed: 54 },
-  { kind: "walker", color: "#6aa8ff", speed: 70 },
-  { kind: "drone", color: "#ff7a9c", speed: 80 },
-];
-
-type AgentMaterials = {
-  shell: THREE.MeshStandardMaterial;
-  accent: THREE.MeshStandardMaterial;
-  glow: THREE.MeshBasicMaterial;
-  halo: THREE.MeshBasicMaterial;
-  ping: THREE.MeshBasicMaterial;
-};
-
-function useAgentMaterials(color: string): AgentMaterials {
-  const materials = useMemo(() => ({
-    shell: new THREE.MeshStandardMaterial({
-      color: "#dfe2ff", roughness: 0.38, metalness: 0.35, flatShading: true, transparent: true,
-    }),
-    accent: new THREE.MeshStandardMaterial({
-      color, emissive: color, emissiveIntensity: 0.35, roughness: 0.45, metalness: 0.2,
-      flatShading: true, transparent: true,
-    }),
-    glow: new THREE.MeshBasicMaterial({ color, transparent: true, toneMapped: false }),
-    halo: new THREE.MeshBasicMaterial({
-      color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
-    }),
-    ping: new THREE.MeshBasicMaterial({
-      color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
-      side: THREE.DoubleSide,
-    }),
-  }), [color]);
-  useEffect(() => () => Object.values(materials).forEach((material) => material.dispose()), [materials]);
-  return materials;
-}
-
-type RigRefs = {
-  a: React.MutableRefObject<THREE.Object3D | null>;
-  b: React.MutableRefObject<THREE.Object3D | null>;
-  c: React.MutableRefObject<THREE.Object3D | null>;
-  d: React.MutableRefObject<THREE.Object3D | null>;
-};
-
-function WalkerModel({ m, rig }: { m: AgentMaterials; rig: RigRefs }) {
-  return (
-    <group ref={(o) => { rig.d.current = o; }}>
-      <group ref={(o) => { rig.a.current = o; }} position={[-0.1, 0.34, 0]}>
-        <mesh position={[0, -0.16, 0]} material={m.shell}><boxGeometry args={[0.1, 0.32, 0.12]} /></mesh>
-        <mesh position={[0, -0.33, 0.03]} material={m.accent}><boxGeometry args={[0.12, 0.04, 0.18]} /></mesh>
-      </group>
-      <group ref={(o) => { rig.b.current = o; }} position={[0.1, 0.34, 0]}>
-        <mesh position={[0, -0.16, 0]} material={m.shell}><boxGeometry args={[0.1, 0.32, 0.12]} /></mesh>
-        <mesh position={[0, -0.33, 0.03]} material={m.accent}><boxGeometry args={[0.12, 0.04, 0.18]} /></mesh>
-      </group>
-      <mesh position={[0, 0.56, 0]} material={m.shell}><capsuleGeometry args={[0.18, 0.2, 4, 10]} /></mesh>
-      <mesh position={[0, 0.58, 0.16]} material={m.accent}><boxGeometry args={[0.16, 0.12, 0.04]} /></mesh>
-      <group ref={(o) => { rig.c.current = o; }} position={[0, 0.72, 0]}>
-        <mesh position={[-0.25, -0.14, 0]} material={m.accent}><capsuleGeometry args={[0.05, 0.18, 3, 8]} /></mesh>
-        <mesh position={[0.25, -0.14, 0]} material={m.accent}><capsuleGeometry args={[0.05, 0.18, 3, 8]} /></mesh>
-      </group>
-      <mesh position={[0, 0.93, 0]} material={m.shell}><icosahedronGeometry args={[0.17, 1]} /></mesh>
-      <mesh position={[0, 0.94, 0.135]} material={m.glow}><boxGeometry args={[0.22, 0.065, 0.05]} /></mesh>
-      <mesh position={[0, 1.12, 0]} material={m.shell}><cylinderGeometry args={[0.012, 0.012, 0.16, 6]} /></mesh>
-      <mesh position={[0, 1.21, 0]} material={m.glow}><sphereGeometry args={[0.035, 10, 10]} /></mesh>
-    </group>
-  );
-}
-
-function DroneModel({ m, rig }: { m: AgentMaterials; rig: RigRefs }) {
-  return (
-    <group ref={(o) => { rig.d.current = o; }}>
-      <mesh position={[0, 0.72, 0]} material={m.shell}><icosahedronGeometry args={[0.22, 1]} /></mesh>
-      <mesh position={[0, 0.74, 0.17]} material={m.glow}><sphereGeometry args={[0.07, 14, 14]} /></mesh>
-      <group ref={(o) => { rig.a.current = o; }} position={[0, 0.72, 0]} rotation={[Math.PI / 2 - 0.35, 0, 0]}>
-        <mesh material={m.accent}><torusGeometry args={[0.36, 0.028, 8, 40]} /></mesh>
-        <mesh position={[0.36, 0, 0]} material={m.glow}><sphereGeometry args={[0.035, 8, 8]} /></mesh>
-        <mesh position={[-0.36, 0, 0]} material={m.glow}><sphereGeometry args={[0.035, 8, 8]} /></mesh>
-      </group>
-      <mesh ref={(o) => { rig.b.current = o; }} position={[0, 0.4, 0]} rotation={[Math.PI, 0, 0]} material={m.halo}>
-        <coneGeometry args={[0.1, 0.34, 14, 1, true]} />
-      </mesh>
-      <mesh ref={(o) => { rig.c.current = o; }} position={[0, 0.72, 0]} material={m.ping}>
-        <ringGeometry args={[0.42, 0.46, 40]} />
-      </mesh>
-    </group>
-  );
-}
-
-function RoverModel({ m, rig }: { m: AgentMaterials; rig: RigRefs }) {
-  const wheel = (x: number, z: number) => (
-    <mesh position={[x, 0.1, z]} rotation={[0, 0, Math.PI / 2]} material={m.accent}>
-      <cylinderGeometry args={[0.1, 0.1, 0.07, 12]} />
-    </mesh>
-  );
-  return (
-    <group ref={(o) => { rig.d.current = o; }}>
-      <group ref={(o) => { rig.a.current = o; }}>{wheel(-0.2, 0.15)}{wheel(0.2, 0.15)}</group>
-      <group ref={(o) => { rig.b.current = o; }}>{wheel(-0.2, -0.15)}{wheel(0.2, -0.15)}</group>
-      <mesh position={[0, 0.25, 0]} material={m.shell}><boxGeometry args={[0.38, 0.17, 0.5]} /></mesh>
-      <mesh position={[0, 0.25, 0.26]} material={m.glow}><boxGeometry args={[0.26, 0.05, 0.02]} /></mesh>
-      <mesh position={[0, 0.45, -0.1]} material={m.shell}><cylinderGeometry args={[0.02, 0.02, 0.26, 6]} /></mesh>
-      <group ref={(o) => { rig.c.current = o; }} position={[0, 0.6, -0.1]}>
-        <mesh material={m.accent}><boxGeometry args={[0.22, 0.12, 0.13]} /></mesh>
-        <mesh position={[-0.05, 0.01, 0.07]} material={m.glow}><sphereGeometry args={[0.03, 8, 8]} /></mesh>
-        <mesh position={[0.05, 0.01, 0.07]} material={m.glow}><sphereGeometry args={[0.03, 8, 8]} /></mesh>
-      </group>
-    </group>
-  );
-}
-
-const MODEL_HEIGHT: Record<AgentKind, number> = { walker: 1.25, drone: 1.0, rover: 0.72 };
-
-type AgentProps = {
-  id: number;
-  spec: AgentSpec;
-  obstacles: React.MutableRefObject<Rect[]>;
-  lanes: LaneRegistry;
-};
-
-function Agent({ id, spec, obstacles, lanes }: AgentProps) {
-  const root = useRef<THREE.Group>(null);
-  const shadow = useRef<THREE.Mesh>(null);
-  const rig: RigRefs = { a: useRef(null), b: useRef(null), c: useRef(null), d: useRef(null) };
-  const m = useAgentMaterials(spec.color);
-  const shadowMaterial = useMemo(() => new THREE.MeshBasicMaterial({
-    color: spec.color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-  }), [spec.color]);
-  useEffect(() => () => shadowMaterial.dispose(), [shadowMaterial]);
-
-  const state = useRef({
-    x: -80 - id * 260,
-    lane: null as number | null,
-    wait: 0.4 + id * 0.9,
-    opacity: 0,
-    hiddenFor: 0,
-    phase: Math.random() * Math.PI * 2,
-    speed: spec.speed * (0.85 + Math.random() * 0.3),
-  });
-
-  useFrame(({ size, viewport, clock }, rawDelta) => {
-    const group = root.current;
-    if (!group) return;
-    const delta = Math.min(rawDelta, 0.05);
-    const s = state.current;
-    const heightPx = THREE.MathUtils.clamp(size.height * 0.07, 40, 62) * (spec.kind === "rover" ? 0.72 : 1);
-    const widthPx = heightPx * 0.8;
-
-    if (s.lane === null) {
-      s.wait -= delta;
-      group.visible = false;
-      if (s.wait <= 0) {
-        s.lane = lanes.claim(id, obstacles.current, heightPx);
-        if (s.lane === null) s.wait = 1.2;
-      }
+function DomAnchor({ selector, sizeFactor, children }: {
+  selector: string;
+  sizeFactor: number;
+  children: React.ReactNode;
+}) {
+  const group = useRef<THREE.Group>(null);
+  const element = useRef<Element | null>(null);
+  useFrame(({ size, viewport }) => {
+    const anchor = group.current;
+    if (!anchor) return;
+    if (!element.current?.isConnected) element.current = document.querySelector(selector);
+    const rect = element.current?.getBoundingClientRect();
+    if (!rect || !rect.width || rect.bottom < -60 || rect.top > size.height + 60) {
+      anchor.visible = false;
       return;
     }
-
-    s.x += s.speed * delta;
-    s.phase += delta * s.speed * 0.12;
-    if (s.x > size.width + 90) {
-      lanes.release(id);
-      s.lane = null;
-      s.x = -90;
-      s.opacity = 0;
-      s.wait = 0.6 + Math.random() * 2.8;
-      group.visible = false;
-      return;
-    }
-
-    const box = { left: s.x - widthPx / 2, right: s.x + widthPx / 2, top: s.lane - heightPx, bottom: s.lane + 4 };
-    const blocked = overlaps(obstacles.current, box);
-    s.hiddenFor = blocked ? s.hiddenFor + delta : 0;
-    // Content moved over this lane (scroll, tab change): hop to a free lane while invisible.
-    if (s.hiddenFor > 1.1 && s.opacity < 0.02) {
-      lanes.release(id);
-      const next = lanes.claim(id, obstacles.current, heightPx);
-      if (next !== null) s.lane = next;
-      s.hiddenFor = 0;
-    }
-    s.opacity = THREE.MathUtils.damp(s.opacity, blocked ? 0 : 1, blocked ? 14 : 5, delta);
-
+    anchor.visible = true;
     const unitsPerPx = viewport.height / size.height;
-    const scale = (heightPx * unitsPerPx) / MODEL_HEIGHT[spec.kind];
-    const pop = 0.82 + 0.18 * s.opacity;
-    group.visible = s.opacity > 0.01;
-    group.position.set(
-      (s.x / size.width - 0.5) * viewport.width,
-      (0.5 - s.lane / size.height) * viewport.height,
+    anchor.position.set(
+      ((rect.left + rect.width / 2) / size.width - 0.5) * viewport.width,
+      (0.5 - (rect.top + rect.height / 2) / size.height) * viewport.height,
       0,
     );
-    group.scale.setScalar(scale * pop);
+    anchor.scale.setScalar(rect.height * unitsPerPx * sizeFactor);
+  });
+  return <group ref={group} visible={false}>{children}</group>;
+}
 
-    for (const material of [m.shell, m.accent, m.glow]) material.opacity = s.opacity;
+function BrandCrystal({ scene, reduced }: { scene: SceneState; reduced: boolean }) {
+  const body = useRef<THREE.Group>(null);
+  const gem = useRef<THREE.MeshStandardMaterial>(null);
+  const heart = useRef<THREE.MeshBasicMaterial>(null);
+  const orbit = useRef<THREE.Group>(null);
+  const spin = useRef(0.6);
+
+  useFrame(({ clock }, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
     const t = clock.elapsedTime;
-    const body = rig.d.current;
-
-    if (spec.kind === "walker") {
-      const swing = Math.sin(s.phase);
-      if (rig.a.current) rig.a.current.rotation.x = swing * 0.6;
-      if (rig.b.current) rig.b.current.rotation.x = -swing * 0.6;
-      if (rig.c.current) rig.c.current.rotation.x = -swing * 0.08;
-      if (body) body.position.y = Math.abs(Math.cos(s.phase)) * 0.04;
-      m.halo.opacity = 0;
-    } else if (spec.kind === "drone") {
-      if (body) {
-        body.position.y = Math.sin(t * 2.3 + id) * 0.08;
-        body.rotation.z = -0.12 + Math.sin(t * 1.7 + id) * 0.04;
-      }
-      if (rig.a.current) rig.a.current.rotation.z += delta * 3.2;
-      m.halo.opacity = s.opacity * (0.35 + Math.sin(t * 12 + id) * 0.12);
-      const ping = rig.c.current;
-      if (ping) {
-        const cycle = (t * 0.45 + id * 0.3) % 1;
-        ping.scale.setScalar(0.6 + cycle * 2.2);
-        m.ping.opacity = s.opacity * (1 - cycle) * 0.55;
-      }
-    } else {
-      const spin = s.phase * 1.6;
-      rig.a.current?.children.forEach((w) => { w.rotation.x = spin; });
-      rig.b.current?.children.forEach((w) => { w.rotation.x = spin; });
-      if (rig.c.current) rig.c.current.rotation.y = Math.sin(t * 1.3 + id) * 0.5;
-      if (body) body.position.y = Math.abs(Math.sin(s.phase * 2)) * 0.012;
-      m.halo.opacity = 0;
+    const target = reduced ? 0.15 : scene.busy ? 4.2 : 0.7;
+    spin.current = THREE.MathUtils.damp(spin.current, target, 2.5, delta) + scene.logoKick;
+    scene.logoKick = THREE.MathUtils.damp(scene.logoKick, 0, 4, delta);
+    if (body.current) {
+      body.current.rotation.y += spin.current * delta;
+      body.current.rotation.z = Math.sin(t * 0.8) * 0.12;
     }
-    if (shadow.current) {
-      shadowMaterial.opacity = s.opacity * 0.28;
-      shadow.current.scale.set(1, 0.18, 1);
-    }
+    if (orbit.current) orbit.current.rotation.z -= (0.9 + spin.current * 0.6) * delta;
+    const pulse = scene.busy ? 0.5 + Math.sin(t * 7) * 0.5 : 0.5 + Math.sin(t * 1.4) * 0.15;
+    if (gem.current) gem.current.emissiveIntensity = 0.45 + pulse * (scene.busy ? 1.1 : 0.4);
+    if (heart.current) heart.current.color.setRGB(0.55 + pulse * 0.6, 0.95, 1.1 + pulse * 0.4);
   });
 
-  const Model = spec.kind === "walker" ? WalkerModel : spec.kind === "drone" ? DroneModel : RoverModel;
   return (
-    <group ref={root} visible={false}>
-      <group rotation={[0.08, 0.95, 0]}>
-        <Model m={m} rig={rig} />
+    <group>
+      <group ref={body}>
+        <mesh scale={[0.46, 0.62, 0.46]}>
+          <octahedronGeometry args={[1, 0]} />
+          <meshStandardMaterial ref={gem} color="#9c8cff" emissive="#6e5cf2" emissiveIntensity={0.6}
+            metalness={0.35} roughness={0.18} flatShading />
+        </mesh>
+        <mesh scale={[0.2, 0.3, 0.2]}>
+          <octahedronGeometry args={[1, 0]} />
+          <meshBasicMaterial ref={heart} color="#8ff5e8" toneMapped={false} />
+        </mesh>
       </group>
-      <mesh ref={shadow} position={[0, 0.01, -0.2]} material={shadowMaterial}>
-        <circleGeometry args={[0.34, 24]} />
-      </mesh>
+      <group ref={orbit} rotation={[1.15, 0.2, 0]}>
+        <mesh>
+          <torusGeometry args={[0.62, 0.018, 6, 64]} />
+          <meshBasicMaterial color="#52d9ca" transparent opacity={0.75} toneMapped={false} />
+        </mesh>
+        <mesh position={[0.62, 0, 0]}>
+          <sphereGeometry args={[0.055, 12, 12]} />
+          <meshBasicMaterial color="#d8fff9" toneMapped={false} />
+        </mesh>
+      </group>
     </group>
   );
 }
 
-function Agents() {
-  const obstacles = useObstacles();
-  const lanes = useMemo(() => new LaneRegistry(), []);
-  const { size } = useThree();
-  const count = size.width < 700 ? 3 : AGENT_SPECS.length;
+function HealthBeacon({ scene, reduced }: { scene: SceneState; reduced: boolean }) {
+  const core = useRef<THREE.MeshBasicMaterial>(null);
+  const halo = useRef<THREE.MeshBasicMaterial>(null);
+  const rings = useRef<(THREE.Mesh | null)[]>([]);
+  const color = useMemo(() => new THREE.Color(HEALTH_COLORS.unknown), []);
+  const target = useMemo(() => new THREE.Color(), []);
+
+  useFrame(({ clock }, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
+    const t = clock.elapsedTime;
+    const state = scene.health;
+    target.set(HEALTH_COLORS[state]);
+    color.lerp(target, 1 - Math.exp(-3 * delta));
+    // Calm when connected, slow amber breathing in demo mode, fast flicker when offline.
+    const rate = reduced ? 0.15 : state === "offline" ? 1.3 : state === "demo" ? 0.55 : 0.35;
+    const flicker = state === "offline" ? 0.75 + Math.abs(Math.sin(t * 11)) * 0.25 : 1;
+    if (core.current) core.current.color.copy(color).multiplyScalar(1.5 * flicker);
+    if (halo.current) {
+      halo.current.color.copy(color);
+      halo.current.opacity = (0.22 + Math.sin(t * rate * Math.PI * 2) * 0.1) * flicker;
+    }
+    rings.current.forEach((ring, index) => {
+      if (!ring) return;
+      const cycle = (t * rate + index / rings.current.length) % 1;
+      ring.scale.setScalar(0.35 + cycle * 1.35);
+      const material = ring.material as THREE.MeshBasicMaterial;
+      material.color.copy(color);
+      material.opacity = (1 - cycle) * (1 - cycle) * (state === "unknown" ? 0.25 : 0.7);
+    });
+  });
+
   return (
-    <>
-      {AGENT_SPECS.slice(0, count).map((spec, index) => (
-        <Agent key={index} id={index} spec={spec} obstacles={obstacles} lanes={lanes} />
+    <group>
+      <mesh>
+        <sphereGeometry args={[0.2, 20, 20]} />
+        <meshBasicMaterial ref={core} toneMapped={false} />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[0.42, 20, 20]} />
+        <meshBasicMaterial ref={halo} transparent depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+      </mesh>
+      {[0, 1].map((index) => (
+        <mesh key={index} ref={(el) => { rings.current[index] = el; }}>
+          <ringGeometry args={[0.46, 0.52, 48]} />
+          <meshBasicMaterial transparent depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+        </mesh>
       ))}
-    </>
+    </group>
   );
 }
 
 // ---------------------------------------------------------------------------
+
+/** Drops bloom and pixel ratio if the device can't hold a smooth frame rate. */
+function PerformanceGuard({ onLow }: { onLow: () => void }) {
+  const sample = useRef({ time: 0, frames: 0, windows: 0, done: false });
+  useFrame((_, delta) => {
+    const s = sample.current;
+    if (s.done) return;
+    s.time += delta;
+    s.frames++;
+    if (s.time < 2) return;
+    s.windows++;
+    // Ignore the first window: lazy chunks and shader compilation make it unrepresentative.
+    if (s.windows > 1 && s.frames / s.time < 42) {
+      s.done = true;
+      onLow();
+    }
+    if (s.windows > 5) s.done = true;
+    s.time = 0;
+    s.frames = 0;
+  });
+  return null;
+}
+
+function SceneDriver({ scene }: { scene: SceneState }) {
+  useEffect(() => onScene((event) => {
+    if (event.type === "tint") {
+      if (event.color) scene.tint.set(event.color);
+      scene.tintTarget = event.color ? 1 : 0;
+    }
+    if (event.type === "busy") scene.busy = event.value;
+    if (event.type === "health") scene.health = event.value;
+    if (event.type === "logo-hover") scene.logoKick = 0.35;
+  }), [scene]);
+  useFrame((_, delta) => {
+    scene.flashAmount = THREE.MathUtils.damp(scene.flashAmount, 0, 1.4, Math.min(delta, 0.05));
+  });
+  return null;
+}
 
 export default function SceneBackground() {
   const reduced = useMemo(prefersReducedMotion, []);
+  const [quality, setQuality] = useState<"high" | "low">("high");
+  const scene = useMemo<SceneState>(() => ({
+    tint: new THREE.Color("#8d7cff"),
+    tintTarget: 0,
+    flash: new THREE.Color("#000000"),
+    flashAmount: 0,
+    busy: false,
+    health: "unknown",
+    logoKick: 0,
+  }), []);
+
+  useEffect(() => () => document.documentElement.classList.remove("scene-3d"), []);
+
   return (
     <Canvas
       className="scene-background"
-      dpr={[1, 1.5]}
+      dpr={quality === "high" ? [1, 1.5] : 1}
       camera={{ fov: 50, position: [0, 0, 10], near: 0.1, far: 80 }}
-      gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
+      gl={{ antialias: false, alpha: false, powerPreference: "high-performance" }}
       style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none" }}
+      onCreated={({ gl }) => {
+        gl.setClearColor("#080b16");
+        document.documentElement.classList.add("scene-3d");
+      }}
       aria-hidden
     >
-      <ambientLight intensity={0.7} />
-      <directionalLight position={[3, 5, 7]} intensity={1.6} />
-      <pointLight position={[-7, 3, 5]} intensity={40} color="#8d7cff" />
-      <pointLight position={[7, -3, 5]} intensity={30} color="#52d9ca" />
-      <RippleField reduced={reduced} />
-      {!reduced && <Agents />}
+      <SceneDriver scene={scene} />
+      <PerformanceGuard onLow={() => setQuality("low")} />
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[3, 5, 7]} intensity={2} />
+      <pointLight position={[-4, 4, 6]} intensity={30} color="#52d9ca" />
+      <Backdrop scene={scene} />
+      <Mist reduced={reduced} scene={scene} />
+      <OrbField reduced={reduced} scene={scene} />
+      <DomAnchor selector='[data-anchor="brand"]' sizeFactor={0.85}>
+        <BrandCrystal scene={scene} reduced={reduced} />
+      </DomAnchor>
+      <DomAnchor selector='[data-anchor="beacon"]' sizeFactor={2.3}>
+        <HealthBeacon scene={scene} reduced={reduced} />
+      </DomAnchor>
+      {quality === "high" && (
+        <EffectComposer multisampling={4} enableNormalPass={false}>
+          <Bloom mipmapBlur intensity={0.85} luminanceThreshold={0.22} luminanceSmoothing={0.35} radius={0.72} />
+        </EffectComposer>
+      )}
     </Canvas>
   );
 }
