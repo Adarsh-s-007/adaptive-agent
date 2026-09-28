@@ -1,5 +1,0 @@
-# Owner: P3. Isolation demo project (blueprint 25.3). Its rules deliberately contradict ApexCart.
-name: LedgerLite
-description: Internal finance tool built with FastAPI and React; runs only behind the company VPN.
-tech_stack: [FastAPI, React, SQLAlchemy, PostgreSQL]
-areas: [auth, api, database, testing]
