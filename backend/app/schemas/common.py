@@ -1,4 +1,4 @@
-"""Common enums, types, and wire models for ProjectPulse (C-2, C-3, C-9)."""
+"""Wire models shared by services, routers and MCP tools."""
 
 from __future__ import annotations
 
@@ -9,72 +9,14 @@ from pydantic import BaseModel, Field
 
 
 class MemoryType(str, Enum):
-    ARCHITECTURE_DECISION = "architecture_decision"
-    SECURITY_RULE = "security_rule"
+    DECISION = "decision"
+    SECURITY_CONSTRAINT = "security_constraint"
+    CONVENTION = "convention"
     API_CONTRACT = "api_contract"
-    INCIDENT_FIX = "incident_fix"
-    CODING_CONVENTION = "coding_convention"
-    DATA_MODEL = "data_model"
-    PERFORMANCE_RULE = "performance_rule"
-    OPERATIONAL_STANDARD = "operational_standard"
-
-
-class RecordStatus(str, Enum):
-    ACTIVE = "active"
-    SUPERSEDED = "superseded"
-    RETRACTED = "retracted"
-
-
-class RetainState(str, Enum):
-    PENDING = "pending"
-    RETAINED = "retained"
-    FAILED = "failed"
-    RETAG_PENDING = "retag_pending"
-
-
-class Relation(str, Enum):
-    EXTENDS = "extends"
-    SUPERSEDES = "supersedes"
-    CONFLICTS = "conflicts"
-    UNRELATED = "unrelated"
-
-
-class CandidateStatus(str, Enum):
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    FILTERED = "filtered"
-
-
-class SessionStatus(str, Enum):
-    OPEN = "open"
-    CLOSED = "closed"
-    EXTRACTED = "extracted"
-
-
-class Verdict(str, Enum):
-    PASS = "pass"
-    FAIL = "fail"
-    WARN = "warn"
-    CONFLICT = "conflict"
-
-
-class Severity(str, Enum):
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-class ConfidenceBand(str, Enum):
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-class BankStatus(str, Enum):
-    PROVISIONING = "provisioning"
-    READY = "ready"
-    ERROR = "error"
+    INCIDENT = "incident"
+    FAILED_APPROACH = "failed_approach"
+    DEPLOYMENT = "deployment"
+    PREFERENCE = "preference"
 
 
 class RecordRef(BaseModel):
@@ -83,88 +25,65 @@ class RecordRef(BaseModel):
     type: str
     title: str
     statement: str
+    rationale: str | None = None
     area: str | None = None
-    importance: int = 3
+    applies_to: list[str] = Field(default_factory=list)
+    importance: int = 2
     status: str = "active"
     confidence_band: str = "high"
     decided_at: str | None = None
     tentative: bool = False
-
-
-class MemoryRecordOut(BaseModel):
-    id: str
-    pill: str
-    project_id: str
-    type: str
-    title: str
-    statement: str
-    rationale: str | None = None
-    area: str | None = None
-    importance: int = 3
-    status: str = "active"
-    confidence_band: str = "high"
-    decided_at: str
-    tentative: bool = False
-    tags: list[str] = Field(default_factory=list)
-    metadata: dict[str, str] = Field(default_factory=dict)
-    hindsight_document_id: str
-    retain_state: str = "retained"
-    evidence_count: int = 0
     review_due: bool = False
-    superseded_by: str | None = None
-    supersedes: str | None = None
-    check_patterns: list[str] = Field(default_factory=list)
-    created_at: str
-    updated_at: str | None = None
-
-
-class ViolationOut(BaseModel):
-    record_id: str
-    record_pill: str
-    severity: str
-    rule_statement: str
-    excerpt: str
-    explanation: str
-    suggested_fix: str
-    pattern_evidence: list[str] = Field(default_factory=list)
-
-
-class CheckResult(BaseModel):
-    verdict: str  # pass, fail, warn, conflict, unavailable
-    violations: list[ViolationOut] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    conflicts: list[str] = Field(default_factory=list)
-    recalled_records: list[RecordRef] = Field(default_factory=list)
-    checked_tokens: int = 0
-    latency_ms: int = 0
+    retain_state: str | None = None
 
 
 class AppliedRecord(BaseModel):
     record: RecordRef
     rank: int
+    recall_rank: int | None = None
+    score: float | None = None
     reason: str
 
 
 class FilteredRecord(BaseModel):
     record: RecordRef
+    recall_rank: int | None = None
     reason: str
 
 
+class Observation(BaseModel):
+    text: str
+    record_ids: list[str] = Field(default_factory=list)
+
+
 class BriefResult(BaseModel):
-    status: str  # ok, empty, memory_unavailable, unfiltered
+    # ok · empty · memory_unavailable · unfiltered · none_apply
+    status: str
+    message: str | None = None
     query: str
     recalled: list[RecordRef] = Field(default_factory=list)
     applied: list[AppliedRecord] = Field(default_factory=list)
     filtered: list[FilteredRecord] = Field(default_factory=list)
-    observations: list[str] = Field(default_factory=list)
+    observations: list[Observation] = Field(default_factory=list)
+    filter_mode: str = "llm"  # llm · heuristic · unfiltered · none
     recall_ms: int = 0
     filter_ms: int = 0
+    recall_attempts: int = 0
     injected_tokens: int = 0
+    all_records_tokens: int = 0
+    active_records: int = 0
+    memory_block: str = ""
+
+
+class GeneratedFileOut(BaseModel):
+    path: str
+    language: str = "text"
+    content: str = ""
 
 
 class RunOutput(BaseModel):
     summary: str
-    files: list[str] = Field(default_factory=list)
+    files: list[GeneratedFileOut] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     followed_record_ids: list[str] = Field(default_factory=list)
 
@@ -172,27 +91,84 @@ class RunOutput(BaseModel):
 class TaskRunOut(BaseModel):
     id: str
     project_id: str
-    mode: str  # baseline or memory
+    session_id: str | None = None
+    comparison_id: str | None = None
+    repeat_index: int = 0
+    mode: str
     task: str
+    status: str = "ok"
+    error: dict[str, Any] | None = None
+    model: str | None = None
     output: RunOutput
     brief: BriefResult | None = None
     usage: dict[str, Any] = Field(default_factory=dict)
+    injected_tokens: int = 0
+    recall_ms: int = 0
+    filter_ms: int = 0
+    llm_ms: int = 0
     latency_ms: int = 0
     created_at: str
 
 
+class Finding(BaseModel):
+    record_id: str
+    record_pill: str
+    record_title: str = ""
+    severity: str
+    rule_statement: str
+    excerpt: str
+    explanation: str
+    suggested_fix: str
+    pattern_evidence: list[str] = Field(default_factory=list)
+    tentative: bool = False
+
+
+# Backwards-compatible alias.
+ViolationOut = Finding
+
+
+class ConflictOut(BaseModel):
+    record_ids: list[str] = Field(default_factory=list)
+    record_pills: list[str] = Field(default_factory=list)
+    explanation: str = ""
+
+
+class CheckResult(BaseModel):
+    id: str | None = None
+    verdict: str  # compliant · violations · unavailable
+    message: str | None = None
+    summary: str = ""
+    judge_mode: str = "llm"  # llm · heuristic
+    judge_model: str | None = None
+    violations: list[Finding] = Field(default_factory=list)
+    warnings: list[Finding] = Field(default_factory=list)
+    conflicts: list[ConflictOut] = Field(default_factory=list)
+    recalled_records: list[RecordRef] = Field(default_factory=list)
+    dropped_findings: int = 0
+    checked_tokens: int = 0
+    latency_ms: int = 0
+
+
 class CompareResult(BaseModel):
     id: str
-    status: str  # pending, completed, failed
+    status: str
     stage: str
+    task: str = ""
+    repeats: int = 1
     baseline_run: TaskRunOut | None = None
     memory_run: TaskRunOut | None = None
     baseline_check: CheckResult | None = None
     memory_check: CheckResult | None = None
-    violations_baseline: int = 0
-    violations_memory: int = 0
-    violation_delta: int = 0  # baseline - memory (positive = improvement)
+    baseline_runs: list[TaskRunOut] = Field(default_factory=list)
+    memory_runs: list[TaskRunOut] = Field(default_factory=list)
+    baseline_checks: list[CheckResult] = Field(default_factory=list)
+    memory_checks: list[CheckResult] = Field(default_factory=list)
+    violations_baseline: float = 0
+    violations_memory: float = 0
+    violation_delta: float = 0
     applied_count: int = 0
     injected_tokens: int = 0
+    summary: dict[str, Any] = Field(default_factory=dict)
     fairness: dict[str, Any] = Field(default_factory=dict)
+    error: dict[str, Any] | None = None
     created_at: str

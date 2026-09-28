@@ -1,0 +1,7 @@
+{
+  "name": "LedgerLite",
+  "description": "Internal finance tool: FastAPI backend with a React frontend. Runs only behind the company VPN.",
+  "tech_stack": "FastAPI, SQLAlchemy, PostgreSQL, React, pytest",
+  "areas": ["auth", "api", "database", "testing"],
+  "team": ["Samira Haddad (lead)", "Tom Becker"]
+}

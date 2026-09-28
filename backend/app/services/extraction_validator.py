@@ -1,35 +1,50 @@
-"""Deterministic validator for extracted memory candidates (EX-5, C5, S1, S2)."""
+"""Deterministic validator for extracted candidates — no LLM (Blueprint §5.2 step 4, §16.7)."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 
-from app.schemas.common import MemoryType
-from app.services.project_memory_service import SECRET_PATTERN
+from app.core.secrets import contains_pii, contains_secret
+from app.core.taxonomy import is_known_type, normalize_type
 from app.services.signals import TRANSIENT_SIGNALS
 
+# Instruction-like text that could poison a prompt if it reached an agent (S1).
 INSTRUCTION_LIKE = re.compile(
-    r"(?i)\b(please\s+(?:do|answer|write|generate)|you\s+must\s+(?:respond|answer|output)|as\s+an\s+ai)\b"
+    r"(?i)(ignore (?:all |any )?(?:the )?(?:previous|prior|above) (?:instructions|rules)|"
+    r"disregard (?:all |the )?(?:previous|above)|you must now|you are now|new instructions|"
+    r"^\s*system\s*:|<\s*/?\s*(?:system|assistant|user)\s*>|\[/?INST\]|as an ai\b|"
+    r"reveal (?:the |your )?(?:system )?prompt|override (?:the )?rules)"
 )
 
-VALID_TAXONOMY = {t.value for t in MemoryType}
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-"})
+
+
+def normalize_for_match(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "").translate(_QUOTES)
+    text = text.replace("**", "").replace("`", "")
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 @dataclass
 class ValidationResult:
     valid: bool
-    status: str  # pending or filtered
+    status: str  # pending · auto_rejected
     reason: str | None = None
     adjusted_confidence: float = 0.8
     flagged: bool = False
+    flags: list[str] = field(default_factory=list)
+    memory_type: str = "decision"
+    matched_turn: int | None = None
 
 
 class ExtractionValidator:
-    """Deterministic validation pipeline for memory candidates before human review."""
+    """Rejects hallucinated evidence, secrets, transient chatter and out-of-taxonomy items."""
 
     MIN_STATEMENT_LEN = 20
     MAX_STATEMENT_LEN = 400
+    MIN_QUOTE_LEN = 8
 
     @classmethod
     def validate(
@@ -40,68 +55,55 @@ class ExtractionValidator:
         transcript_texts: list[str],
         stated_by: str = "human",
         initial_confidence: float = 0.8,
+        turn_indices: list[int] | None = None,
     ) -> ValidationResult:
-        clean_statement = statement.strip()
-        clean_quote = evidence_quote.strip()
+        statement = (statement or "").strip()
+        quote = (evidence_quote or "").strip()
 
-        # 1. Secret check
-        if SECRET_PATTERN.search(clean_statement) or SECRET_PATTERN.search(clean_quote):
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason="Statement or quote appears to contain secrets or credentials.",
-            )
+        def reject(reason: str) -> ValidationResult:
+            return ValidationResult(False, "auto_rejected", reason, 0.0, memory_type=normalize_type(memory_type))
 
-        # 2. Taxonomy check
-        if memory_type not in VALID_TAXONOMY:
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason=f"Unsupported memory type '{memory_type}'. Must be one of {sorted(VALID_TAXONOMY)}.",
-            )
+        if contains_secret(statement) or contains_secret(quote):
+            return reject("Contains something that looks like a secret or credential.")
+        if contains_pii(statement):
+            return reject("Contains personal data (email address or card-like number).")
+        if not is_known_type(memory_type):
+            return reject(f"Type '{memory_type}' is outside the eight-type taxonomy.")
+        if len(statement) < cls.MIN_STATEMENT_LEN:
+            return reject(f"Statement is too short ({len(statement)} chars; minimum {cls.MIN_STATEMENT_LEN}).")
+        if len(statement) > cls.MAX_STATEMENT_LEN:
+            return reject(f"Statement is too long ({len(statement)} chars; maximum {cls.MAX_STATEMENT_LEN}).")
+        if len(quote) < cls.MIN_QUOTE_LEN:
+            return reject("Evidence quote is missing or too short to verify.")
 
-        # 3. Length check (20-400 chars)
-        if len(clean_statement) < cls.MIN_STATEMENT_LEN:
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason=f"Statement is too short ({len(clean_statement)} chars). Minimum is {cls.MIN_STATEMENT_LEN}.",
-            )
-        if len(clean_statement) > cls.MAX_STATEMENT_LEN:
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason=f"Statement is too long ({len(clean_statement)} chars). Maximum is {cls.MAX_STATEMENT_LEN}.",
-            )
+        needle = normalize_for_match(quote)
+        matched_turn: int | None = None
+        for position, text in enumerate(transcript_texts):
+            if needle in normalize_for_match(text):
+                matched_turn = turn_indices[position] if turn_indices else position + 1
+                break
+        if matched_turn is None:
+            return reject("Evidence quote is not a verbatim substring of the transcript.")
 
-        # 4. Verbatim quote presence in transcript turns (C5)
-        quote_found = any(clean_quote in turn_text for turn_text in transcript_texts)
-        if not quote_found:
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason="Evidence quote does not appear verbatim in any session turn.",
-            )
+        if TRANSIENT_SIGNALS.search(statement):
+            return reject("Describes transient state (branch, local machine, current build), not a durable rule.")
 
-        # 5. Transient state check
-        if TRANSIENT_SIGNALS.search(clean_statement):
-            return ValidationResult(
-                valid=False,
-                status="filtered",
-                reason="Candidate represents a transient state or WIP item, not a durable decision.",
-            )
+        flags: list[str] = []
+        if INSTRUCTION_LIKE.search(statement) or INSTRUCTION_LIKE.search(quote):
+            flags.append("instruction_like")
 
-        # 6. Instruction-like check
-        flagged = bool(INSTRUCTION_LIKE.search(clean_statement))
-
-        # 7. Agent-only confidence cap at 0.4
-        conf = initial_confidence
-        if stated_by == "agent":
-            conf = min(conf, 0.4)
+        confidence = max(0.0, min(1.0, initial_confidence))
+        normalized_type = normalize_type(memory_type)
+        if stated_by == "agent" and normalized_type in ("decision", "security_constraint", "preference", "convention"):
+            confidence = min(confidence, 0.4)
+            flags.append("agent_proposed")
 
         return ValidationResult(
             valid=True,
             status="pending",
-            adjusted_confidence=conf,
-            flagged=flagged,
+            adjusted_confidence=confidence,
+            flagged="instruction_like" in flags,
+            flags=flags,
+            memory_type=normalized_type,
+            matched_turn=matched_turn,
         )

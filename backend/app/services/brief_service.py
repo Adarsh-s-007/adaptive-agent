@@ -1,32 +1,74 @@
-"""Brief Service: Zero-memory short-circuit, recall grouping, applicability filter (BR-1)."""
+"""Brief: recall → group by record → status post-filter → applicability → ≤5 records (§4.2).
+
+The rendered `<project_memory>` block is the only thing that differs between a baseline
+run and a memory-aware run.
+"""
 
 from __future__ import annotations
 
 import json
 import time
 
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.gateways.hindsight_gateway import HindsightGateway, RecalledFact
+from app.core.errors import AppError
+from app.core.tokens import count_tokens
+from app.db.governed_models import MemoryRecord
+from app.gateways.hindsight_gateway import (
+    BankMissing,
+    HindsightGateway,
+    HindsightUnavailable,
+)
 from app.gateways.llm_gateway import LLMGateway
-from app.gateways.project_context import BankResolver
-from app.schemas.common import AppliedRecord, BriefResult, FilteredRecord, RecordRef
+from app.gateways.project_context import BankResolver, ProjectContext
+from app.models.entities import Project
+from app.prompts.schemas import ApplicabilityItem, ApplicabilityResponse
+from app.prompts.templates import APPLICABILITY_SYSTEM
+from app.schemas.common import (
+    AppliedRecord,
+    BriefResult,
+    FilteredRecord,
+    Observation,
+    RecordRef,
+)
+from app.services import heuristics
+from app.services.audit_service import AuditService
 from app.services.governed_memory_service import GovernedMemoryService
+from app.services.serializers import record_ref
+
+MAX_APPLIED = 5
 
 
-class ApplicabilityItem(BaseModel):
-    record_id: str
-    applies: bool = True
-    reason: str = Field(..., max_length=150)
+def ref(record: MemoryRecord) -> RecordRef:
+    return RecordRef(**record_ref(record))
 
 
-class ApplicabilityResponse(BaseModel):
-    selections: list[ApplicabilityItem] = Field(default_factory=list)
+def render_memory_block(records: list[MemoryRecord]) -> str:
+    """Layer 3 of the generation prompt: a delimited data block, fields length-capped."""
+    if not records:
+        return ""
+    entries = []
+    for r in records:
+        scope = ", ".join(json.loads(r.applies_to_json or "[]")) or (r.area or "project-wide")
+        lines = [
+            f"- id: {r.pill}",
+            f"  type: {r.type}",
+            f"  title: {r.title[:80]}",
+            f"  rule: {r.statement[:400]}",
+        ]
+        if r.rationale:
+            lines.append(f"  rationale: {r.rationale[:300]}")
+        lines.append(f"  decided: {r.decided_at.date().isoformat() if r.decided_at else 'unknown'}")
+        lines.append(f"  scope: {scope[:200]}")
+        if r.confidence_band == "low" or r.tentative:
+            lines.append("  confidence: tentative (agent-proposed)")
+        entries.append("\n".join(lines))
+    body = "\n".join(entries).replace("</project_memory>", "")
+    return f"<project_memory>\n{body}\n</project_memory>"
 
 
 class BriefService:
-    """Orchestrates Brief generation for coding agents before implementing tasks."""
+    """Builds the task brief a coding agent receives before it writes code."""
 
     def __init__(
         self,
@@ -34,9 +76,19 @@ class BriefService:
         llm: LLMGateway | None = None,
         memory_service: GovernedMemoryService | None = None,
     ) -> None:
-        self.hindsight = hindsight or HindsightGateway()
-        self.llm = llm or LLMGateway()
+        from app.gateways.hindsight_gateway import get_hindsight_gateway
+        from app.gateways.llm_gateway import get_llm_gateway
+
+        self.hindsight = hindsight or get_hindsight_gateway()
+        self.llm = llm or get_llm_gateway()
         self.memory_service = memory_service or GovernedMemoryService(self.hindsight)
+
+    @staticmethod
+    def build_query(task: str, file_paths: list[str] | None = None) -> str:
+        query = task.strip()
+        if file_paths:
+            query += "\nFiles: " + ", ".join(p.strip() for p in file_paths[:10] if p.strip())
+        return query
 
     async def build_brief(
         self,
@@ -44,234 +96,220 @@ class BriefService:
         project_id: str,
         task: str,
         file_paths: list[str] | None = None,
+        *,
+        run_id: str | None = None,
     ) -> BriefResult:
         ctx = BankResolver.resolve(db, project_id)
+        try:
+            return await self._build(db, ctx, task, file_paths, run_id)
+        finally:
+            AuditService.flush(db, ctx)
 
-        # 1. Zero active records short-circuit (R3)
-        active_count = self.memory_service.count_active(db, project_id)
-        if active_count == 0:
+    async def _build(
+        self,
+        db: Session,
+        ctx: ProjectContext,
+        task: str,
+        file_paths: list[str] | None,
+        run_id: str | None,
+    ) -> BriefResult:
+        query = self.build_query(task, file_paths)
+        active = self.memory_service.get_active_records(db, ctx.project_id)
+        all_tokens = count_tokens(render_memory_block(active)) if active else 0
+
+        # R3: a project with no memory makes no recall call.
+        if not active:
             return BriefResult(
                 status="empty",
-                query=task,
-                recalled=[],
-                applied=[],
-                filtered=[],
-                observations=[],
-                recall_ms=0,
-                filter_ms=0,
-                injected_tokens=0,
+                message="This project has no active memory yet. Memory forms from reviewed sessions.",
+                query=query,
+                filter_mode="none",
             )
 
-        # 2. Query construction
-        query = task.strip()
-        if file_paths:
-            query += f"\nAffected files: {', '.join(file_paths[:10])}"
-
-        # 3. Recall from Hindsight
-        recall_start = time.perf_counter()
-        recalled_facts: list[RecalledFact] = []
-        try:
-            recalled_facts = await self.hindsight.recall(
-                ctx=ctx,
+        if not getattr(self.hindsight, "available", True):
+            return BriefResult(
+                status="memory_unavailable",
+                message="Hindsight is offline, so project memory cannot be recalled right now.",
                 query=query,
+                filter_mode="none",
+                active_records=len(active),
+                all_records_tokens=all_tokens,
+            )
+
+        try:
+            outcome = await self.hindsight.recall_detailed(
+                ctx,
+                query,
                 purpose="brief",
                 max_tokens=1500,
                 exclude_status=["superseded", "retracted"],
+                expect_results=True,
+                run_id=run_id,
             )
-        except Exception:
+        except BankMissing:
+            project = db.get(Project, ctx.project_id)
+            if project:
+                project.bank_status = "error"
+                project.bank_error = "Hindsight bank not found. Reprovision in Settings."
+                db.commit()
             return BriefResult(
                 status="memory_unavailable",
+                message="The project's Hindsight bank is missing. Reprovision it in Settings.",
                 query=query,
-                recalled=[],
-                applied=[],
-                filtered=[],
-                observations=[],
-                recall_ms=int((time.perf_counter() - recall_start) * 1000),
-                filter_ms=0,
-                injected_tokens=0,
+                filter_mode="none",
+                active_records=len(active),
             )
-        recall_ms = int((time.perf_counter() - recall_start) * 1000)
+        except (HindsightUnavailable, AppError) as exc:
+            return BriefResult(
+                status="memory_unavailable",
+                message=f"Recall failed: {getattr(exc, 'message', str(exc))}",
+                query=query,
+                filter_mode="none",
+                active_records=len(active),
+            )
 
-        if not recalled_facts:
-            # Fallback to top active records if direct semantic search yielded empty
-            active_records = self.memory_service.get_active_records(db, project_id)
-            if active_records:
-                top_active = active_records[:3]
-                applied = [
-                    AppliedRecord(
-                        record=RecordRef(
-                            id=r.id,
-                            pill=r.pill,
-                            type=r.type,
-                            title=r.title,
-                            statement=r.statement,
-                            area=r.area,
-                            importance=r.importance,
-                            status=r.status,
-                            confidence_band=r.confidence_band,
-                            decided_at=r.decided_at.isoformat() if r.decided_at else None,
-                        ),
-                        rank=idx,
-                        reason="Project engineering baseline rule",
-                    )
-                    for idx, r in enumerate(top_active, start=1)
-                ]
-                injected = sum(len(r.record.statement.split()) for r in applied)
-                return BriefResult(
-                    status="unfiltered",
-                    query=query,
-                    recalled=[a.record for a in applied],
-                    applied=applied,
-                    filtered=[],
-                    observations=[],
-                    recall_ms=recall_ms,
-                    filter_ms=0,
-                    injected_tokens=injected,
+        # Group facts by record, keeping the best rank; observations map via source facts.
+        active_map = {r.id: r for r in active}
+        best_rank: dict[str, int] = {}
+        best_score: dict[str, float] = {}
+        for fact in outcome.facts:
+            for rid in fact.record_ids or [fact.record_id]:
+                # PostgreSQL post-filter: retired or retag_pending records never reach the agent.
+                if rid in active_map and rid not in best_rank:
+                    best_rank[rid] = fact.rank
+                    best_score[rid] = fact.score
+        observations = [
+            Observation(text=o.text, record_ids=[r for r in o.record_ids if r in active_map])
+            for o in outcome.observations[:6]
+        ]
+        recalled = sorted(best_rank, key=lambda rid: best_rank[rid])
+        recalled_records = [active_map[rid] for rid in recalled]
+        base = {
+            "query": outcome.query,
+            "recalled": [ref(r) for r in recalled_records],
+            "observations": observations,
+            "recall_ms": outcome.latency_ms,
+            "recall_attempts": outcome.attempts,
+            "active_records": len(active),
+            "all_records_tokens": all_tokens,
+        }
+        if not recalled_records:
+            return BriefResult(
+                status="empty",
+                message="No project memory applies to this task.",
+                filter_mode="none",
+                **base,
+            )
+
+        started = time.perf_counter()
+        filter_mode = "llm"
+        selections: list[ApplicabilityItem] | None
+        if not getattr(self.llm, "configured", True):
+            # No LLM configured: deterministic scope matching, labelled "heuristic".
+            selections = heuristics.applicability(task, recalled_records)
+            filter_mode = "heuristic"
+        else:
+            try:
+                selections = await self._llm_applicability(task, recalled_records)
+            except AppError:
+                selections = None
+        filter_ms = int((time.perf_counter() - started) * 1000)
+
+        if selections is None:
+            # §16.6: applicability failed → top 3 by rank, labelled "unfiltered".
+            filter_mode = "unfiltered"
+            chosen = recalled_records[:3]
+            applied = [
+                AppliedRecord(
+                    record=ref(r),
+                    rank=i,
+                    recall_rank=best_rank[r.id],
+                    score=best_score[r.id],
+                    reason="Unfiltered: applicability check unavailable; top recall rank.",
                 )
-            return BriefResult(
-                status="empty",
-                query=query,
-                recalled=[],
-                applied=[],
-                filtered=[],
-                observations=[],
-                recall_ms=recall_ms,
-                filter_ms=0,
-                injected_tokens=0,
-            )
-
-        # 4. Status post-filter against DB (exclude any superseded or retracted in Postgres)
-        unique_ids = list({f.record_id for f in recalled_facts})
-        status_map = self.memory_service.active_status_map(db, project_id, unique_ids)
-        valid_facts = [f for f in recalled_facts if status_map.get(f.record_id) == "active"]
-
-        if not valid_facts:
-            return BriefResult(
-                status="empty",
-                query=query,
-                recalled=[],
-                applied=[],
-                filtered=[],
-                observations=[],
-                recall_ms=recall_ms,
-                filter_ms=0,
-                injected_tokens=0,
-            )
-
-        # Load governed records from DB
-        records_db = self.memory_service.get_records(db, [f.record_id for f in valid_facts])
-        record_map = {r.id: r for r in records_db}
-
-        recalled_refs = [
-            RecordRef(
-                id=r.id,
-                pill=r.pill,
-                type=r.type,
-                title=r.title,
-                statement=r.statement,
-                area=r.area,
-                importance=r.importance,
-                status=r.status,
-                confidence_band=r.confidence_band,
-                decided_at=r.decided_at.isoformat() if r.decided_at else None,
-                tentative=r.tentative,
-            )
-            for r in records_db
-        ]
-
-        # 5. Applicability filter
-        filter_start = time.perf_counter()
-        candidates_summary = [
-            {"id": r.id, "pill": r.pill, "type": r.type, "title": r.title, "rule": r.statement[:200]}
-            for r in records_db
-        ]
-
-        prompt_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a project memory applicability assessor. Determine if each engineering record "
-                    "applies directly to the coding task. Give a crisp reason under 20 words for why it applies or does not apply."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Task: {task}\n\nProject Memory Candidates:\n{json.dumps(candidates_summary, ensure_ascii=False)}",
-            },
-        ]
-
-        try:
-            llm_res = await self.llm.complete_json(
-                tier="small",
-                messages=prompt_messages,
-                schema=ApplicabilityResponse,
-                job="applicability",
-                temperature=0.0,
-            )
-            resp: ApplicabilityResponse = llm_res.parsed
-            applied_items = [s for s in resp.selections if s.applies and s.record_id in record_map]
-            filtered_items = [s for s in resp.selections if not s.applies and s.record_id in record_map]
-        except Exception:
-            # Fallback to top-3 unfiltered
-            applied_items = [
-                ApplicabilityItem(record_id=r.id, applies=True, reason="Relevant task pattern")
-                for r in records_db[:3]
+                for i, r in enumerate(chosen, start=1)
             ]
-            filtered_items = []
-
-        # Sort applied by importance then rank, limit to 5
-        applied_sorted = sorted(
-            applied_items,
-            key=lambda item: record_map[item.record_id].importance,
-            reverse=True,
-        )[:5]
-
-        applied_refs: list[AppliedRecord] = []
-        for idx, item in enumerate(applied_sorted, start=1):
-            r = record_map[item.record_id]
-            ref = RecordRef(
-                id=r.id,
-                pill=r.pill,
-                type=r.type,
-                title=r.title,
-                statement=r.statement,
-                area=r.area,
-                importance=r.importance,
-                status=r.status,
-                confidence_band=r.confidence_band,
-                decided_at=r.decided_at.isoformat() if r.decided_at else None,
-                tentative=r.tentative,
+            filtered = [
+                FilteredRecord(record=ref(r), recall_rank=best_rank[r.id], reason="Below the top-3 recall cut.")
+                for r in recalled_records[3:]
+            ]
+            block = render_memory_block(chosen)
+            return BriefResult(
+                status="unfiltered",
+                message="Applicability filter unavailable; using the top 3 recalled records.",
+                applied=applied,
+                filtered=filtered,
+                filter_mode=filter_mode,
+                filter_ms=filter_ms,
+                injected_tokens=count_tokens(block),
+                memory_block=block,
+                **base,
             )
-            applied_refs.append(AppliedRecord(record=ref, rank=idx, reason=item.reason[:150]))
 
-        filtered_refs: list[FilteredRecord] = []
-        for item in filtered_items:
-            r = record_map[item.record_id]
-            ref = RecordRef(
-                id=r.id,
-                pill=r.pill,
-                type=r.type,
-                title=r.title,
-                statement=r.statement,
-                area=r.area,
-                importance=r.importance,
-                status=r.status,
-                confidence_band=r.confidence_band,
-                decided_at=r.decided_at.isoformat() if r.decided_at else None,
+        by_id = {s.record_id: s for s in selections}
+        applies = [r for r in recalled_records if by_id.get(r.id) and by_id[r.id].applies]
+        applies.sort(key=lambda r: (-(r.importance or 1), best_rank[r.id]))
+        chosen = applies[:MAX_APPLIED]
+        chosen_ids = {r.id for r in chosen}
+        applied = [
+            AppliedRecord(
+                record=ref(r),
+                rank=i,
+                recall_rank=best_rank[r.id],
+                score=best_score[r.id],
+                reason=(by_id[r.id].reason or "Applies to this task.")[:200],
             )
-            filtered_refs.append(FilteredRecord(record=ref, reason=item.reason[:150]))
+            for i, r in enumerate(chosen, start=1)
+        ]
+        filtered = []
+        for r in recalled_records:
+            if r.id in chosen_ids:
+                continue
+            sel = by_id.get(r.id)
+            reason = (sel.reason if sel and not sel.applies else None) or (
+                "Applies, but over the 5-record cap." if sel and sel.applies else "Not assessed as applicable."
+            )
+            filtered.append(FilteredRecord(record=ref(r), recall_rank=best_rank[r.id], reason=reason[:200]))
 
-        filter_ms = int((time.perf_counter() - filter_start) * 1000)
-        injected_tokens = sum(len(a.record.statement.split()) for a in applied_refs)
-
+        block = render_memory_block(chosen)
+        for record in chosen:
+            record.times_applied = (record.times_applied or 0) + 1
+        db.commit()
         return BriefResult(
-            status="ok" if applied_refs else "unfiltered",
-            query=query,
-            recalled=recalled_refs,
-            applied=applied_refs,
-            filtered=filtered_refs,
-            observations=[],
-            recall_ms=recall_ms,
+            status="ok" if chosen else "none_apply",
+            message=None if chosen else f"Recalled {len(recalled_records)}, none apply to this task.",
+            applied=applied,
+            filtered=filtered,
+            filter_mode=filter_mode,
             filter_ms=filter_ms,
-            injected_tokens=injected_tokens,
+            injected_tokens=count_tokens(block),
+            memory_block=block,
+            **base,
         )
+
+    async def _llm_applicability(self, task: str, records: list[MemoryRecord]) -> list[ApplicabilityItem]:
+        payload = [
+            {
+                "record_id": r.id,
+                "type": r.type,
+                "rule": r.statement[:400],
+                "scope": json.loads(r.applies_to_json or "[]") or [r.area or "project-wide"],
+            }
+            for r in records
+        ]
+        result = await self.llm.complete_json(
+            tier="small",
+            messages=[
+                {"role": "system", "content": APPLICABILITY_SYSTEM},
+                {
+                    "role": "user",
+                    "content": f"Task:\n{task[:4000]}\n\nRecalled records (data):\n{json.dumps(payload, ensure_ascii=False)}",
+                },
+            ],
+            schema=ApplicabilityResponse,
+            job="applicability",
+            temperature=0.0,
+            max_tokens=1200,
+        )
+        parsed: ApplicabilityResponse = result.parsed
+        return parsed.selections

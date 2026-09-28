@@ -1,13 +1,20 @@
-# ProjectPulse coding-agent instructions
+# ProjectPulse coding-agent instructions (GitHub Copilot)
 
-Before implementing a coding task, call the ProjectPulse
-`recall_project_memory` MCP tool with the current project UUID and task
-description. Follow relevant returned memories. Ask for the project UUID if
-it is not yet known.
+ProjectPulse exposes reviewed project memory over MCP (`.mcp.json`). MCP does not call
+tools automatically — follow this order for every coding task:
 
-After discovering a durable engineering decision, incident fix, API contract,
-or convention, call `retain_project_memory`. Never retain secrets, API keys,
-passwords, or personal data. Do not retain ephemeral status updates.
+1. **Before implementing:** call `projectpulse_brief` with the ProjectPulse project UUID
+   and the task. Follow every applied record unless the task explicitly changes one;
+   if you must break one, do the task the compliant way and say so.
+2. **Before finishing:** call `projectpulse_check` with your code, diff or plan and fix
+   every violation it reports.
+3. **When the session ends:** call `projectpulse_submit_session` with the transcript so
+   the team can review proposed memory in the Inbox. Nothing is remembered unreviewed.
+4. For "why" questions about past decisions, call `projectpulse_ask`.
 
-MCP availability does not automatically invoke these tools; use them explicitly
-in this order for each task.
+If no project UUID is known, ask the developer to pick one in the dashboard
+(Settings → Connect a coding agent) and provide its ID.
+
+Never send secrets, API keys, passwords or personal data to any tool. Do not submit
+transient status updates. The legacy `recall_project_memory` / `retain_project_memory`
+tools still work but bypass the review gate — prefer the governed tools above.

@@ -1,0 +1,62 @@
+[
+  {
+    "key": "B01",
+    "type": "security_constraint",
+    "area": "auth",
+    "decided_at": "2026-05-02T10:00:00Z",
+    "title": "Short-lived tokens in sessionStorage",
+    "statement": "Internal tool behind VPN: short-lived (15 min) access tokens may be kept in sessionStorage; no refresh tokens; SSO via the company identity provider.",
+    "rationale": "The tool is only reachable on the VPN and sessions are short.",
+    "applies_to": ["login", "session", "tokens", "sso"],
+    "importance": 3,
+    "decided_by": "Samira Haddad",
+    "session": "LedgerLite auth design",
+    "quote": "Inside the VPN we keep the 15-minute access token in sessionStorage and rely on SSO — no refresh tokens.",
+    "check_patterns": []
+  },
+  {
+    "key": "B02",
+    "type": "api_contract",
+    "area": "api",
+    "decided_at": "2026-05-09T10:00:00Z",
+    "title": "RFC 7807 errors",
+    "statement": "Errors use RFC 7807 application/problem+json.",
+    "rationale": "Matches the company API guidelines.",
+    "applies_to": ["errors", "endpoints", "responses"],
+    "importance": 2,
+    "decided_by": "Tom Becker",
+    "session": "LedgerLite API guidelines",
+    "quote": "All error responses are RFC 7807 problem+json.",
+    "check_patterns": []
+  },
+  {
+    "key": "B03",
+    "type": "decision",
+    "area": "database",
+    "decided_at": "2026-05-16T10:00:00Z",
+    "title": "Money as NUMERIC(12,2)",
+    "statement": "Money is NUMERIC(12,2) via SQLAlchemy Decimal.",
+    "rationale": "Finance team reports read decimals directly.",
+    "applies_to": ["amounts", "ledger entries", "reports"],
+    "importance": 3,
+    "decided_by": "Samira Haddad",
+    "session": "LedgerLite data model",
+    "quote": "Amounts are NUMERIC(12,2) mapped to Decimal in SQLAlchemy.",
+    "check_patterns": []
+  },
+  {
+    "key": "B04",
+    "type": "preference",
+    "area": "testing",
+    "decided_at": "2026-05-23T10:00:00Z",
+    "title": "pytest with factory-boy",
+    "statement": "Tests use pytest with factory-boy fixtures.",
+    "rationale": "Team standard for Python services.",
+    "applies_to": ["tests", "fixtures"],
+    "importance": 1,
+    "decided_by": "Tom Becker",
+    "session": "LedgerLite testing",
+    "quote": "pytest plus factory-boy for fixtures, like our other services.",
+    "check_patterns": []
+  }
+]

@@ -1,21 +1,31 @@
-﻿# ProjectPulse 90-second MCP-first demo
+# Demo script
 
-Before judges arrive, start the API and frontend, open `http://localhost:5176`, and keep **Agent activity** ready. If no Hindsight key is configured, say clearly that the demonstration uses **Demo mode - local sample memory**. The MCP tool call remains real; only its memory backend is local.
+Numbers in narration are whatever the live run measures — never pre-written.
 
-**0-15 seconds - The problem.** "A new coding-agent session loses project decisions. ProjectPulse is a project-scoped MCP memory layer, not a generic chatbot." Show the landing screen and click **Launch E-commerce MCP demo**.
+## Setup (once)
 
-**15-30 seconds - Agent A's learning.** Open **Memory timeline**. Point at the JWT security rule: refresh tokens must use HTTP-only, Secure cookies; LocalStorage is forbidden. Show type, tags, source Agent A, session, timestamp, and storage origin. Mention the other realistic API, order, payment, and frontend memories.
+1. `.env` has `HINDSIGHT_API_KEY` and `GROQ_API_KEY`; API and web are running.
+2. Projects → **Launch the ApexCart demo**, then **Add LedgerLite (isolation)**. (Or `python scripts/seed.py --reset`.)
 
-**30-55 seconds - A truly fresh Agent B session.** Open **Agent activity** and click **Run fresh Agent B MCP demo**. This invokes the registered `recall_project_memory` tool through the official MCP Client, with task "Implement login and refresh-token flow for this project." It creates a new session and a recall audit event.
+## Hero — 90 seconds
 
-**55-75 seconds - The proof.** In the chronological activity stream, show "Fresh Agent B session started", user task, `projectpulse.recall_project_memory`, exact recalled JWT evidence, and the local sample approach that uses HttpOnly/Secure cookies and avoids LocalStorage. Point to **Why this answer is project-aware**. State that the sample result is *not* an external coding agent.
+| Time | Screen | Action | Narration |
+| --- | --- | --- | --- |
+| 0:00 | Overview (ApexCart) | — | "AI coding agents start every session with amnesia. Last Tuesday our tech lead corrected one about auth. Today a different developer opens a fresh session. Will it know?" |
+| 0:10 | Workspace → S-104 | **Extract memories** | "ProjectPulse read the session and found two decisions — each with the exact quote it came from — and threw away the chatter: the branch name, a laptop Node issue, a deferred NextAuth idea." |
+| 0:22 | Inbox | `A`, `A` | "I approve; they're now in ApexCart's own Hindsight bank." |
+| 0:30 | Compare | Hero task → **Run** | "Same model, same task, temperature 0. Left: no memory. Right: ProjectPulse recalls what applies." |
+| 0:45 | Compare result | Point at both verdicts and the strip | "Left puts the token in localStorage and invents its own response format — violations of decisions this team already made. Right uses the `__Host-apx_rt` cookie and CSRF header from Tuesday's session, our envelope and login rate limit. Every rule links to where it came from." |
+| 0:55 | Recall panel (right pane) | Expand **Filtered** | "It recalled more than it used. Webhook and pooling rules were filtered out, with reasons — memory is selective, not dumped." |
+| 1:10 | Workspace | New session → "Add a dark-mode toggle to the header" | "A UI task gets the UI convention — and none of the auth rules." |
+| 1:25 | Memory → Timeline | — | "One correction, captured once, applied and checked in every later session." |
 
-**75-90 seconds - Real integration path.** Open **MCP setup**, choose Claude Code or GitHub Copilot, show the generated client JSON and project instructions. Explain that compatible agents can call the three tools before/after coding, but MCP does not invoke tools automatically. With Hindsight configured, new projects use real isolated Hindsight banks.
+## Extended (≈ 4 minutes)
 
-For an independent stdio transport proof, run from the repository root:
-
-```bash
-backend/.venv/bin/python projectpulse-mcp/demo_cli.py
-```
-
-This launches the MCP server as a child process, prints the actual recalled memory, and logs a labelled sample result. Refresh the dashboard activity tab. See [README.md](../README.md) for setup and demo-mode limitations.
+1. **Supersession** — Workspace → S-131 *Checkout load test* → Extract. The Inbox shows a *supersedes* candidate side by side with the June `connection_limit=25` rule, and a *duplicate* of the singleton-db incident (approve → evidence added, nothing re-retained). Approve the replacement. Memory → Timeline shows the strike-through chain; Compare/Workspace with *"Checkout times out under load — how should I configure the database client?"* uses only the PgBouncer rule.
+2. **Ask** — Check & Ask → *"Why don't we keep carts in Redis?"* → answer from the failed-approach record with Based-on pills.
+3. **Rulebook history** — Overview → **What changed**: before/after diff of the Rulebook.
+4. **Isolation** — switch to LedgerLite (top bar) and brief the same login task: LedgerLite's own sessionStorage rule, nothing from ApexCart. Settings → isolation violations blocked: **0**.
+5. **Degradation** — Settings → *Force Hindsight offline*: red banner, memory-aware runs blocked with the reason, approvals queue as *Waiting to sync*, baseline still runs. Toggle back; the retry worker syncs the queue.
+6. **Check** — Check & Ask → sample code → violations with excerpts, fixes and pattern evidence.
+7. **Proof** — Settings → **Run eval**: precision / recall / forbidden-record rate on the labelled set, reported as measured.

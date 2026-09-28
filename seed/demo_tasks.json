@@ -1,0 +1,38 @@
+[
+  {
+    "id": "hero-login",
+    "label": "Hero · login that survives reloads",
+    "task": "Add a POST /api/auth/login route and the client code that keeps the user signed in across reloads.",
+    "expect": "Memory-aware run uses the __Host-apx_rt cookie, X-ApexCart-CSRF, the response envelope and the login rate limit."
+  },
+  {
+    "id": "checkout-db",
+    "label": "Checkout times out under load",
+    "task": "Checkout times out under load — how should I configure the database client?",
+    "expect": "After S-131 is approved, only the PgBouncer rule applies; the June pool-size rule never appears."
+  },
+  {
+    "id": "dark-mode",
+    "label": "Dark-mode toggle (UI only)",
+    "task": "Add a dark-mode toggle to the header.",
+    "expect": "Only the UI convention applies; no auth, payments or database rule."
+  },
+  {
+    "id": "guest-cart",
+    "label": "Keep a guest's cart",
+    "task": "Keep a guest's cart when they come back next week.",
+    "expect": "The failed Redis-cart approach is recalled; carts stay in Postgres."
+  },
+  {
+    "id": "stripe-webhook",
+    "label": "Stripe payment_intent.succeeded",
+    "task": "Handle the Stripe payment_intent.succeeded webhook and mark the order paid.",
+    "expect": "Webhook rule (raw body, constructEvent, idempotency) and the response envelope."
+  },
+  {
+    "id": "delete-order",
+    "label": "Admin: delete an order",
+    "task": "Add an admin endpoint to delete an order.",
+    "expect": "Soft-delete via deleted_at, the envelope and route conventions."
+  }
+]

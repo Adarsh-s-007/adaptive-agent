@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
@@ -38,7 +39,11 @@ def generate_uuidv7() -> str:
 
 
 def generate_record_pill(record_id: str) -> str:
-    """Generate a human-readable record pill like 'MEM-7F3A' from a record ID."""
-    clean = record_id.replace("-", "").upper()
-    suffix = clean[:4] if len(clean) >= 4 else clean.ljust(4, "0")
-    return f"MEM-{suffix}"
+    """Generate a human-readable record pill like 'MEM-7F3A' from a record ID.
+
+    UUIDv7 IDs start with a millisecond timestamp, so their leading hex digits are
+    shared by every record created within about a minute. The pill is derived from a
+    hash of the full ID instead so neighbouring records stay distinguishable.
+    """
+    digest = hashlib.sha1(record_id.encode()).hexdigest().upper()
+    return f"MEM-{digest[:4]}"

@@ -1,0 +1,35 @@
+{
+  "set": "default",
+  "project": "ApexCart",
+  "note": "Blueprint §25.4. Labels reference records by a substring unique to each record's statement, so live-extracted records (L1-L3) resolve after S-104 and S-131 are approved. Labels whose record does not exist yet are reported as missing, not counted.",
+  "records": {
+    "A01": "amount_cents",
+    "A02": "success: boolean",
+    "A03": "app/api/<resource>/route.ts",
+    "A04": "logger.redact()",
+    "A05": "stripe.webhooks.constructEvent",
+    "A06": "new PrismaClient()",
+    "A07": "connection_limit=25",
+    "A08": "Redis with a 24 h TTL",
+    "A09": "deleted_at",
+    "A10": "prisma migrate deploy",
+    "A11": "components/ui",
+    "A12": "@upstash/ratelimit",
+    "A13": "regression test",
+    "L1": "__Host-apx_rt",
+    "L2": "X-ApexCart-CSRF",
+    "L3": "connection_limit=1"
+  },
+  "tasks": [
+    {"id": "E1", "task": "Add POST /api/auth/login and keep the user signed in across reloads", "must_apply": ["L1", "L2", "A02", "A12"], "must_not_apply": ["A05", "A08"]},
+    {"id": "E2", "task": "Handle Stripe payment_intent.succeeded", "must_apply": ["A05", "A02"], "must_not_apply": ["L1", "A11"]},
+    {"id": "E3", "task": "Add an admin endpoint to delete an order", "must_apply": ["A09", "A02", "A03"], "must_not_apply": ["A05", "A11"]},
+    {"id": "E4", "task": "Checkout times out under load — configure the DB client", "must_apply": ["A06", "L3"], "must_not_apply": ["A07", "L1"]},
+    {"id": "E5", "task": "Keep a guest's cart when they come back next week", "must_apply": ["A08"], "must_not_apply": ["A12", "A05"]},
+    {"id": "E6", "task": "Add a dark-mode toggle to the header", "must_apply": ["A11"], "must_not_apply": ["L1", "L2", "A05", "A06", "L3"]},
+    {"id": "E7", "task": "Show order totals with a percentage discount", "must_apply": ["A01"], "must_not_apply": ["A12", "L1"]},
+    {"id": "E8", "task": "Add a gift_message column to orders and ship it", "must_apply": ["A10"], "must_not_apply": ["L1", "A11"]},
+    {"id": "E9", "task": "Log failed login attempts for debugging", "must_apply": ["A04", "A12"], "must_not_apply": ["A05", "A08"]},
+    {"id": "E10", "task": "Fix: coupon applied twice at checkout", "must_apply": ["A13", "A01"], "must_not_apply": ["L1", "A11"]}
+  ]
+}

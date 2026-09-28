@@ -1,26 +1,27 @@
-"""Authentication and authorization utilities for ProjectPulse API."""
+"""Shared-token access control for the deployed API (Blueprint §12.5, §17)."""
 
 from __future__ import annotations
 
-import os
 import secrets
 
-from app.core.errors import AppError, AppErrorCode
 from fastapi import Header, status
+
+from app.config import get_settings
+from app.core.errors import AppError, AppErrorCode
 
 
 def get_access_token() -> str | None:
-    return os.environ.get("APP_ACCESS_TOKEN", "").strip() or None
+    return (get_settings().app_access_token or "").strip() or None
 
 
 def verify_bearer_token(authorization: str | None = Header(default=None)) -> None:
-    """Verify bearer token against APP_ACCESS_TOKEN if configured.
+    """Require `Authorization: Bearer <APP_ACCESS_TOKEN>` when a token is configured.
 
-    Uses constant-time comparison to prevent timing attacks.
+    Local development runs open when APP_ACCESS_TOKEN is empty. The comparison is
+    constant-time to avoid leaking the token through timing.
     """
     expected = get_access_token()
     if not expected:
-        # Auth disabled / open access in development or test if APP_ACCESS_TOKEN is not set
         return
 
     if not authorization:
@@ -38,10 +39,19 @@ def verify_bearer_token(authorization: str | None = Header(default=None)) -> Non
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
 
-    provided = parts[1]
-    if not secrets.compare_digest(provided, expected):
+    if not secrets.compare_digest(parts[1].encode(), expected.encode()):
         raise AppError(
             code=AppErrorCode.UNAUTHORIZED,
-            message="Invalid or expired access token.",
+            message="Invalid access token.",
             status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+def require_demo_mode() -> None:
+    """Admin routes exist only on demo deployments (DEMO_MODE=true)."""
+    if not get_settings().demo_mode:
+        raise AppError(
+            code=AppErrorCode.FORBIDDEN,
+            message="Admin endpoints are disabled (DEMO_MODE is off).",
+            status_code=status.HTTP_403_FORBIDDEN,
         )

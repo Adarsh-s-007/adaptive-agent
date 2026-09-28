@@ -1,639 +1,827 @@
-"""FastAPI route handlers for /api/v1 endpoints per Blueprint C-8."""
+"""/api/v1 routers (Blueprint §13.3). Routers validate and delegate; they never call Hindsight or the LLM."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.errors import AppError, AppErrorCode
-from app.core.security import verify_bearer_token
+from app.config import get_settings
+from app.core.errors import AppError, AppErrorCode, not_found
+from app.core.ratelimit import llm_rate_limit
+from app.core.security import require_demo_mode, verify_bearer_token
 from app.db.database import get_db
 from app.db.governed_models import (
+    AuditEvent,
+    CheckRun,
     ComparisonRun,
+    EvalRun,
     MemoryCandidate,
     MemoryRecord,
     SessionTurn,
+    TaskRun,
 )
-from app.gateways.hindsight_gateway import HindsightGateway
-from app.gateways.llm_gateway import LLMGateway
-from app.models.entities import AgentSession
-from app.schemas.common import (
-    BriefResult,
-    CheckResult,
-    CompareResult,
-    MemoryRecordOut,
+from app.gateways.hindsight_gateway import HindsightUnavailable
+from app.gateways.project_context import context_for, get_project
+from app.services.audit_service import AuditService
+from app.services.container import services
+from app.services.eval_service import EvalService
+from app.services.seed_service import demo_tasks
+from app.services.serializers import (
+    candidate_dto,
+    check_dto,
+    comparison_dto,
+    iso,
+    loads,
+    project_dto,
+    record_dto,
+    record_ref,
+    run_dto,
+    session_dto,
 )
-from app.services.brief_service import BriefService
-from app.services.check_service import CheckService
-from app.services.compare_service import CompareService
-from app.services.extraction_validator import ExtractionValidator
-from app.services.generation_service import GenerationService
-from app.services.governed_memory_service import GovernedMemoryService
-from app.services.metrics_service import MetricsService
-from app.services.project_memory_service import project_or_404
-from app.services.project_service import ProjectService
-from app.services.review_service import ReviewService
-from app.services.seed_service import SeedService
-from app.services.signals import TranscriptPreparer
-from app.services.timeline_service import TimelineService
-from app.services.transcript_parser import TranscriptParser
+
+from .schemas import (
+    ApproveBody,
+    AskBody,
+    BriefBody,
+    BulkApproveBody,
+    CheckBody,
+    CloseBody,
+    CompareBody,
+    DatasetBody,
+    EvalBody,
+    ImportBody,
+    MessageBody,
+    OfflineBody,
+    ProjectCreateBody,
+    RecordCreateBody,
+    RejectBody,
+    RememberBody,
+    RetractBody,
+    ReviewBody,
+    RunBody,
+    SeedBody,
+    SessionCreateBody,
+    SupersedeBody,
+)
 
 router = APIRouter(dependencies=[Depends(verify_bearer_token)])
-DBSession = Annotated[Session, Depends(get_db)]
-
-# Services
-hindsight_gw = HindsightGateway()
-llm_gw = LLMGateway()
-mem_service = GovernedMemoryService(hindsight_gw)
-project_service = ProjectService(hindsight_gw)
-brief_service = BriefService(hindsight_gw, llm_gw, mem_service)
-check_service = CheckService(hindsight_gw, llm_gw, mem_service)
-gen_service = GenerationService(llm_gw, brief_service)
-compare_service = CompareService(gen_service, check_service)
-review_service = ReviewService(mem_service)
-timeline_service = TimelineService()
-metrics_service = MetricsService(hindsight_gw)
-seed_service = SeedService(mem_service)
+DB = Annotated[Session, Depends(get_db)]
+RateLimited = [Depends(llm_rate_limit)]
 
 
-# --- Request Models ---
-
-class BriefRequest(BaseModel):
-    task: str = Field(..., min_length=3, max_length=5000)
-    file_paths: list[str] | None = None
-
-
-class CheckRequest(BaseModel):
-    content: str = Field(..., min_length=5)
-    run_id: str | None = None
-
-
-class CompareRequest(BaseModel):
-    task: str = Field(..., min_length=3)
-
-
-class GovernedMemoryCreate(BaseModel):
-    title: str = Field(..., min_length=3, max_length=255)
-    statement: str = Field(..., min_length=15, max_length=12000)
-    memory_type: str
-    rationale: str | None = None
-    area: str | None = None
-    importance: int = Field(default=3, ge=1, le=5)
-    tags: list[str] = Field(default_factory=list)
-    evidence_quote: str | None = None
-    check_patterns: list[str] = Field(default_factory=list)
+# =============================================================== status / projects
+@router.get("/status", tags=["health"])
+async def status():
+    svc = services()
+    hindsight = await svc.hindsight.health()
+    llm = await svc.llm.health()
+    settings = get_settings()
+    return {
+        "hindsight": hindsight,
+        "llm": llm,
+        "demo_mode": settings.demo_mode,
+        "force_offline": svc.hindsight.is_forced_offline,
+        "auth_required": bool(settings.app_access_token),
+        "models": {"large": settings.llm_model_large, "small": settings.llm_model_small},
+        "empty_recall_retries": svc.hindsight.stats.get("empty_recall_retries", 0),
+    }
 
 
-class SupersedeRequest(BaseModel):
-    title: str = Field(..., min_length=3, max_length=255)
-    statement: str = Field(..., min_length=15, max_length=12000)
-    rationale: str | None = None
-    area: str | None = None
-    importance: int = Field(default=3, ge=1, le=5)
-    evidence_quote: str | None = None
+@router.get("/demo-tasks", tags=["demo"])
+def get_demo_tasks():
+    return demo_tasks()
 
 
-class TranscriptImportRequest(BaseModel):
-    title: str = "Imported Session"
-    transcript: str = Field(..., min_length=10, max_length=200000)
-    format_hint: str = "markdown"  # markdown, jsonl, plain
-    developer: str = "Developer"
-    agent_label: str = "Coding Agent"
+@router.post("/projects", status_code=201, tags=["projects"])
+async def create_project(body: ProjectCreateBody, db: DB):
+    svc = services()
+    project = await svc.projects.create_project(db, body.name, body.description, body.tech_stack, body.areas)
+    return project_dto(project, svc.projects.stats(db, project.id))
 
 
-class CandidateReviewRequest(BaseModel):
-    resolution: str = "new"  # new, supersede, keep_both, add_evidence
-    target_record_id: str | None = None
-    edited_title: str | None = None
-    edited_statement: str | None = None
-    reviewer: str = "Reviewer"
+@router.get("/projects", tags=["projects"])
+def list_projects(db: DB):
+    return services().projects.list_projects(db)
 
 
-# --- Brief Endpoint ---
-
-@router.post("/projects/{pid}/brief", response_model=BriefResult)
-async def get_brief(pid: str, body: BriefRequest, db: DBSession):
-    """Obtain task Brief: applied rules, reasons, and injected tokens (BR-2)."""
-    return await brief_service.build_brief(db, pid, body.task, body.file_paths)
+@router.get("/projects/{pid}", tags=["projects"])
+def project_detail(pid: str, db: DB):
+    return services().projects.detail(db, pid)
 
 
-# --- Check Endpoint ---
-
-@router.post("/projects/{pid}/check", response_model=CheckResult)
-async def check_compliance(pid: str, body: CheckRequest, db: DBSession):
-    """Validate code or diff against governed project decisions (CK-3)."""
-    return await check_service.check(db, pid, body.content, body.run_id)
-
-
-# --- Compare Endpoints ---
-
-@router.post("/projects/{pid}/compare", response_model=CompareResult)
-async def run_comparison(pid: str, body: CompareRequest, db: DBSession):
-    """Run baseline vs memory-aware trial and compute violation delta (CP-2)."""
-    return await compare_service.compare(db, pid, body.task)
+@router.post("/projects/{pid}/provision", tags=["projects"])
+async def provision_project(pid: str, db: DB, force: bool = False):
+    project = await services().projects.provision_project(db, pid, force=force)
+    return {
+        "project_id": project.id,
+        "bank_id": project.hindsight_bank_id,
+        "bank_status": project.bank_status,
+        "bank_error": project.bank_error,
+    }
 
 
-@router.get("/projects/{pid}/compare/{cid}", response_model=CompareResult)
-def get_comparison(pid: str, cid: str, db: DBSession):
-    """Retrieve comparison run progress or results."""
-    comp = db.get(ComparisonRun, cid)
-    if not comp or comp.project_id != pid:
-        raise AppError(code=AppErrorCode.NOT_FOUND, message="Comparison run not found.", status_code=404)
-    return CompareResult(
-        id=comp.id,
-        status=comp.status,
-        stage=comp.stage,
-        violations_baseline=comp.violations_baseline,
-        violations_memory=comp.violations_memory,
-        violation_delta=comp.violation_delta,
-        applied_count=comp.applied_count,
-        injected_tokens=comp.injected_tokens,
-        fairness=json.loads(comp.fairness_json or "{}"),
-        created_at=comp.created_at.isoformat(),
+@router.get("/projects/{pid}/bank", tags=["projects"])
+async def bank_summary(pid: str, db: DB):
+    return await services().projects.bank_summary(db, pid)
+
+
+# ======================================================================= sessions
+@router.post("/projects/{pid}/sessions", status_code=201, tags=["sessions"])
+def create_session(pid: str, body: SessionCreateBody, db: DB):
+    session = services().sessions.create(
+        db, pid, title=body.title, developer=body.developer, agent_label=body.agent_label
+    )
+    return session_dto(session, turns=[])
+
+
+@router.get("/projects/{pid}/sessions", tags=["sessions"])
+def list_sessions(pid: str, db: DB, include_legacy: bool = False):
+    return services().sessions.list(db, pid, include_legacy=include_legacy)
+
+
+@router.post("/projects/{pid}/sessions/import", status_code=201, tags=["sessions"])
+async def import_session(pid: str, body: ImportBody, db: DB):
+    svc = services()
+    session = svc.sessions.import_transcript(
+        db,
+        pid,
+        title=body.title,
+        text=body.body,
+        developer=body.developer,
+        agent_label=body.agent_label,
+        occurred_at=body.occurred_at,
+        format_hint=body.fmt,
+    )
+    result: dict[str, Any] = {
+        "session_id": session.id,
+        "session": session_dto(session),
+        "turns_imported": session.turn_count,
+        "candidates_extracted": 0,
+        "message": "Session imported. End it or run extraction to propose memory.",
+    }
+    if body.extract:
+        extracted = await svc.extraction.extract_session(db, pid, session.id)
+        result["candidates_extracted"] = len(extracted["candidates"])
+        result["stats"] = extracted["stats"]
+        result["message"] = "Session imported and extracted. Candidates await review in the Inbox."
+    return result
+
+
+@router.get("/projects/{pid}/sessions/{sid}", tags=["sessions"])
+def session_detail(pid: str, sid: str, db: DB):
+    svc = services()
+    data = svc.sessions.detail(db, pid, sid)
+    runs = {
+        r.id: r
+        for r in db.scalars(select(TaskRun).where(TaskRun.session_id == sid)).all()
+    }
+    for turn in data.get("turns", []):
+        if turn.get("run_id") and turn["run_id"] in runs:
+            run = runs[turn["run_id"]]
+            turn["run"] = {
+                "id": run.id,
+                "mode": run.mode,
+                "brief": loads(run.brief_snapshot_json, None),
+                "recall_ms": run.recall_ms,
+                "filter_ms": run.filter_ms,
+                "llm_ms": run.llm_ms,
+                "injected_tokens": run.injected_tokens,
+                "files": loads(run.output_files_json, []),
+                "notes": loads(run.output_notes_json, []),
+                "followed_record_ids": loads(run.followed_record_ids_json, []),
+                "model": run.model,
+            }
+    data["candidates"] = [
+        candidate_dto(c)
+        for c in db.scalars(select(MemoryCandidate).where(MemoryCandidate.session_id == sid)).all()
+    ]
+    return data
+
+
+@router.post("/projects/{pid}/sessions/{sid}/messages", dependencies=RateLimited, tags=["sessions"])
+async def send_message(pid: str, sid: str, body: MessageBody, db: DB):
+    return await services().sessions.send_message(
+        db, pid, sid, content=body.content, use_memory=body.use_memory, file_paths=body.file_paths
     )
 
 
-# --- Governed Records Endpoints ---
+@router.post("/projects/{pid}/sessions/{sid}/close", dependencies=RateLimited, tags=["sessions"])
+async def close_session(pid: str, sid: str, db: DB, body: CloseBody | None = None):
+    svc = services()
+    session = svc.sessions.close(db, pid, sid)
+    result: dict[str, Any] = {"session": session_dto(session), "candidates": [], "filtered": []}
+    if body is None or body.extract:
+        extracted = await svc.extraction.extract_session(db, pid, sid)
+        db.refresh(session)
+        result.update(_extraction_payload(db, pid, sid, extracted))
+        result["session"] = session_dto(session)
+    return result
 
-@router.get("/projects/{pid}/memories", response_model=list[MemoryRecordOut])
-def list_governed_records(
+
+def _extraction_payload(db: Session, pid: str, sid: str, extracted: dict[str, Any]) -> dict[str, Any]:
+    rows = db.scalars(select(MemoryCandidate).where(MemoryCandidate.session_id == sid)).all()
+    related = {
+        r.id: r
+        for r in db.scalars(
+            select(MemoryRecord).where(MemoryRecord.id.in_([c.related_record_id for c in rows if c.related_record_id]))
+        ).all()
+    }
+    return {
+        "candidates": [candidate_dto(c, related.get(c.related_record_id)) for c in rows if c.status == "pending"],
+        "filtered": [candidate_dto(c) for c in rows if c.status in ("auto_rejected", "filtered")],
+        "stats": extracted.get("stats", {}),
+    }
+
+
+@router.post("/projects/{pid}/sessions/{sid}/extract", dependencies=RateLimited, tags=["sessions"])
+async def extract_session(pid: str, sid: str, db: DB):
+    extracted = await services().extraction.extract_session(db, pid, sid)
+    return _extraction_payload(db, pid, sid, extracted)
+
+
+@router.post("/projects/{pid}/sessions/{sid}/turns/{tid}/remember", status_code=201, tags=["sessions"])
+async def remember_turn(pid: str, sid: str, tid: str, body: RememberBody, db: DB):
+    """“Remember this”: a human-authored record (confidence 1.0) with the turn as evidence."""
+    svc = services()
+    session = svc.sessions.get(db, pid, sid)
+    turn = db.get(SessionTurn, tid)
+    if not turn or turn.session_id != session.id:
+        raise not_found("Turn")
+    quote = (body.quote or turn.content[:400]).strip()
+    if quote not in turn.content:
+        raise AppError(AppErrorCode.VALIDATION_FAILED, "The quote must be copied from the message.", status_code=422)
+    record = await svc.memory.create_record(
+        db,
+        pid,
+        title=body.title,
+        statement=body.statement,
+        memory_type=body.type,
+        rationale=body.rationale,
+        area=body.area,
+        source_session_id=session.id,
+        evidence_quote=quote,
+        confidence=1.0,
+        stated_by="human",
+        source="manual",
+        approved_by=body.reviewer,
+        evidence_turn=turn.turn_index,
+    )
+    return record_dto(record, include_content=True)
+
+
+# ===================================================================== candidates
+def _candidate_list(db: Session, pid: str, status: str | None) -> list[dict[str, Any]]:
+    svc = services()
+    get_project(db, pid)
+    rows = svc.review.list_candidates(db, pid, status)
+    related = {
+        r.id: r
+        for r in db.scalars(
+            select(MemoryRecord).where(MemoryRecord.id.in_([c.related_record_id for c in rows if c.related_record_id]))
+        ).all()
+    }
+    return [candidate_dto(c, related.get(c.related_record_id)) for c in rows]
+
+
+@router.get("/projects/{pid}/candidates", tags=["inbox"])
+def list_candidates(pid: str, db: DB, status: str = "pending"):
+    return _candidate_list(db, pid, status)
+
+
+@router.get("/projects/{pid}/inbox", tags=["inbox"])
+def inbox(pid: str, db: DB):
+    """Candidates grouped by source session, with the filtered rows and yield counts."""
+    items = _candidate_list(db, pid, "all")
+    sessions: dict[str, dict[str, Any]] = {}
+    from app.models.entities import AgentSession
+
+    for item in items:
+        group = sessions.get(item["session_id"])
+        if group is None:
+            s = db.get(AgentSession, item["session_id"])
+            group = {
+                "session": session_dto(s) if s else {"id": item["session_id"], "title": "Session"},
+                "pending": [],
+                "filtered": [],
+                "reviewed": [],
+            }
+            sessions[item["session_id"]] = group
+        if item["status"] == "pending":
+            group["pending"].append(item)
+        elif item["status"] == "auto_rejected":
+            group["filtered"].append(item)
+        else:
+            group["reviewed"].append(item)
+    groups = sorted(
+        sessions.values(),
+        key=lambda g: (-len(g["pending"]), g["session"].get("occurred_at") or ""),
+    )
+    return {
+        "groups": [g for g in groups if g["pending"] or g["filtered"]],
+        "counts": {
+            "pending": sum(len(g["pending"]) for g in groups),
+            "filtered": sum(len(g["filtered"]) for g in groups),
+            "reviewed": sum(len(g["reviewed"]) for g in groups),
+        },
+    }
+
+
+def _approval_response(result: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"status": "approved", "resolution": result.get("resolution")}
+    record = result.get("record")
+    if record is not None:
+        out["record"] = record_dto(record)
+        out["id"] = record.id
+    if result.get("superseded_record") is not None:
+        out["superseded_record"] = record_dto(result["superseded_record"])
+    if result.get("evidence_id"):
+        out["evidence_id"] = result["evidence_id"]
+    return out
+
+
+@router.post("/projects/{pid}/candidates/{cid}/approve", tags=["inbox"])
+async def approve_candidate(pid: str, cid: str, body: ApproveBody, db: DB):
+    result = await services().review.approve_candidate(
+        db,
+        cid,
+        body.resolution,
+        body.target_record_id,
+        reviewer=body.reviewer,
+        project_id=pid,
+        edits=body.edits,
+    )
+    return _approval_response(result)
+
+
+@router.post("/projects/{pid}/candidates/{cid}/reject", tags=["inbox"])
+def reject_candidate(pid: str, cid: str, body: RejectBody, db: DB):
+    candidate = services().review.reject_candidate(db, cid, body.reason, body.reviewer, project_id=pid)
+    return candidate_dto(candidate)
+
+
+@router.post("/projects/{pid}/candidates/{cid}/review", tags=["inbox"])
+async def review_candidate(pid: str, cid: str, body: ReviewBody, db: DB):
+    """Legacy combined endpoint: resolution=reject | new | supersede | keep_both | add_evidence."""
+    svc = services()
+    if body.resolution == "reject":
+        candidate = svc.review.reject_candidate(db, cid, "Rejected during review.", body.reviewer, project_id=pid)
+        return {"status": "rejected", "candidate_id": candidate.id}
+    result = await svc.review.approve_candidate(
+        db,
+        cid,
+        body.resolution,
+        body.target_record_id,
+        body.edited_title,
+        body.edited_statement,
+        body.reviewer,
+        project_id=pid,
+    )
+    return _approval_response(result)
+
+
+@router.post("/projects/{pid}/candidates/approve-high-confidence", tags=["inbox"])
+async def approve_high_confidence(pid: str, body: BulkApproveBody, db: DB):
+    results = await services().review.approve_high_confidence(db, pid, body.reviewer)
+    return {"approved": len(results), "records": [record_dto(r["record"]) for r in results if r.get("record")]}
+
+
+# ======================================================================= memories
+def _list_records(db: Session, pid: str, status: str | None, type_: str | None, area: str | None, q: str | None):
+    get_project(db, pid)
+    query = select(MemoryRecord).where(MemoryRecord.project_id == pid)
+    if status and status != "all":
+        query = query.where(MemoryRecord.status == status)
+    if type_:
+        query = query.where(MemoryRecord.type == type_)
+    if area:
+        query = query.where(MemoryRecord.area == area)
+    records = db.scalars(query.order_by(MemoryRecord.decided_at.desc())).all()
+    if q:
+        needle = q.lower()
+        records = [r for r in records if needle in r.title.lower() or needle in r.statement.lower() or needle in r.pill.lower()]
+    return [record_dto(r) for r in records]
+
+
+@router.get("/projects/{pid}/memories", tags=["memory"])
+def list_memories(
     pid: str,
-    db: DBSession,
-    status: str = "active",
+    db: DB,
+    status: str | None = "active",
+    type: str | None = None,
     area: str | None = None,
     q: str | None = None,
 ):
-    """List governed records with filtering."""
-    query = select(MemoryRecord).where(MemoryRecord.project_id == pid)
-    if status:
-        query = query.where(MemoryRecord.status == status)
-    if area:
-        query = query.where(MemoryRecord.area == area)
-
-    records = db.scalars(query.order_by(MemoryRecord.importance.desc(), MemoryRecord.decided_at.desc())).all()
-
-    if q:
-        kw = q.lower()
-        records = [r for r in records if kw in r.title.lower() or kw in r.statement.lower()]
-
-    return [
-        MemoryRecordOut(
-            id=r.id,
-            pill=r.pill,
-            project_id=r.project_id,
-            type=r.type,
-            title=r.title,
-            statement=r.statement,
-            rationale=r.rationale,
-            area=r.area,
-            importance=r.importance,
-            status=r.status,
-            confidence_band=r.confidence_band,
-            decided_at=r.decided_at.isoformat(),
-            tentative=r.tentative,
-            tags=json.loads(r.tags_json or "[]"),
-            metadata=json.loads(r.metadata_json or "{}"),
-            hindsight_document_id=r.hindsight_document_id,
-            retain_state=r.retain_state,
-            evidence_count=len(r.evidence),
-            review_due=False,
-            supersedes=r.supersedes_id,
-            superseded_by=r.superseded_by_id,
-            check_patterns=json.loads(r.check_patterns_json or "[]"),
-            created_at=r.created_at.isoformat(),
-            updated_at=r.updated_at.isoformat() if r.updated_at else None,
-        )
-        for r in records
-    ]
+    """Library browsing in PostgreSQL (admin only — never used for agent recall)."""
+    return _list_records(db, pid, status, type, area, q)
 
 
-@router.post("/projects/{pid}/memories", response_model=MemoryRecordOut, status_code=201)
-async def create_governed_record(pid: str, body: GovernedMemoryCreate, db: DBSession):
-    """Create a new governed record through the outbox pattern."""
-    record = await mem_service.create_record(
-        db=db,
-        project_id=pid,
-        title=body.title,
-        statement=body.statement,
-        memory_type=body.memory_type,
-        rationale=body.rationale,
-        area=body.area,
-        importance=body.importance,
-        evidence_quote=body.evidence_quote,
-        tags=body.tags,
-        check_patterns=body.check_patterns,
-    )
-    return MemoryRecordOut(
-        id=record.id,
-        pill=record.pill,
-        project_id=record.project_id,
-        type=record.type,
-        title=record.title,
-        statement=record.statement,
-        rationale=record.rationale,
-        area=record.area,
-        importance=record.importance,
-        status=record.status,
-        confidence_band=record.confidence_band,
-        decided_at=record.decided_at.isoformat(),
-        tags=json.loads(record.tags_json or "[]"),
-        metadata=json.loads(record.metadata_json or "{}"),
-        hindsight_document_id=record.hindsight_document_id,
-        retain_state=record.retain_state,
-        evidence_count=1 if body.evidence_quote else 0,
-        review_due=False,
-        created_at=record.created_at.isoformat(),
-    )
-
-
-@router.post("/projects/{pid}/memories/{id}/supersede", response_model=MemoryRecordOut)
-async def supersede_governed_record(pid: str, id: str, body: SupersedeRequest, db: DBSession):
-    """Execute 5-step supersession protocol on an active record (RC-2)."""
-    record = await mem_service.supersede(
-        db=db,
-        old_record_id=id,
-        title=body.title,
-        statement=body.statement,
-        rationale=body.rationale,
-        area=body.area,
-        importance=body.importance,
-        evidence_quote=body.evidence_quote,
-    )
-    return MemoryRecordOut(
-        id=record.id,
-        pill=record.pill,
-        project_id=record.project_id,
-        type=record.type,
-        title=record.title,
-        statement=record.statement,
-        rationale=record.rationale,
-        area=record.area,
-        importance=record.importance,
-        status=record.status,
-        confidence_band=record.confidence_band,
-        decided_at=record.decided_at.isoformat(),
-        tags=json.loads(record.tags_json or "[]"),
-        metadata=json.loads(record.metadata_json or "{}"),
-        hindsight_document_id=record.hindsight_document_id,
-        retain_state=record.retain_state,
-        supersedes=record.supersedes_id,
-        created_at=record.created_at.isoformat(),
-    )
-
-
-# --- Session Import & Candidate Review Endpoints ---
-
-@router.post("/projects/{pid}/sessions/import", status_code=201)
-async def import_session_transcript(pid: str, body: TranscriptImportRequest, db: DBSession):
-    """Import transcript, parse turns, extract candidates, and populate Inbox (EX-1, EX-2)."""
-    project = project_or_404(db, pid)
-
-    # 1. Parse and scrub turns
-    parsed_turns = TranscriptParser.parse(body.transcript, body.format_hint)
-    prepared_turns = TranscriptPreparer.prepare_turns(parsed_turns)
-
-    # 2. Create AgentSession
-    session = AgentSession(
-        project_id=pid,
-        agent_name=body.agent_label,
-        task=body.title,
-    )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-
-    # 3. Store SessionTurns
-    turn_texts = []
-    for t in prepared_turns:
-        db.add(SessionTurn(session_id=session.id, turn_index=t.turn_index, role=t.role, content=t.content))
-        turn_texts.append(t.content)
-    db.commit()
-
-    # 4. Extract candidates using signal extraction & validator
-    candidates_created = 0
-    for t in prepared_turns:
-        if t.role == "tool":
-            continue
-        hints = TranscriptPreparer.find_signal_hints(t.content)
-        if hints:
-            # Extract candidate candidate sentence
-            sentences = [s.strip() for s in t.content.split(".") if len(s.strip()) >= 20]
-            for s in sentences[:2]:
-                val = ExtractionValidator.validate(
-                    statement=s,
-                    memory_type="architecture_decision",
-                    evidence_quote=s,
-                    transcript_texts=turn_texts,
-                    stated_by=t.role,
-                )
-                cand = MemoryCandidate(
-                    session_id=session.id,
-                    project_id=pid,
-                    type="architecture_decision",
-                    title=s[:60] + "...",
-                    statement=s,
-                    evidence_quote=s,
-                    status=val.status,
-                    filter_reason=val.reason,
-                    confidence=val.adjusted_confidence,
-                    flagged=val.flagged,
-                )
-                db.add(cand)
-                candidates_created += 1
-
-    db.commit()
-    return {
-        "session_id": session.id,
-        "turns_imported": len(prepared_turns),
-        "candidates_extracted": candidates_created,
-        "message": "Session imported. Candidates awaiting review in Inbox.",
-    }
-
-
-@router.get("/projects/{pid}/candidates")
-def list_candidates(pid: str, db: DBSession, status: str = "pending"):
-    """List candidates awaiting review in Inbox (GV-1)."""
-    candidates = review_service.list_candidates(db, pid, status)
-    return [
-        {
-            "id": c.id,
-            "session_id": c.session_id,
-            "type": c.type,
-            "title": c.title,
-            "statement": c.statement,
-            "evidence_quote": c.evidence_quote,
-            "status": c.status,
-            "confidence": c.confidence,
-            "flagged": c.flagged,
-            "filter_reason": c.filter_reason,
-            "created_at": c.created_at.isoformat(),
-        }
-        for c in candidates
-    ]
-
-
-@router.post("/projects/{pid}/candidates/{cid}/review")
-async def review_candidate(pid: str, cid: str, body: CandidateReviewRequest, db: DBSession):
-    """Approve or reject candidate with specified resolution (GV-1)."""
-    if body.resolution == "reject":
-        res = review_service.reject_candidate(db, cid, "Rejected during review.")
-        return {"status": "rejected", "candidate_id": res.id}
-
-    res = await review_service.approve_candidate(
-        db=db,
-        candidate_id=cid,
-        resolution=body.resolution,
-        target_record_id=body.target_record_id,
-        edited_title=body.edited_title,
-        edited_statement=body.edited_statement,
-        reviewer=body.reviewer,
-    )
-    return {"status": "approved", "resolution": body.resolution, "id": getattr(res, "id", "")}
-
-
-# --- Project Provisioning, Rulebook & Ask Endpoints (HS-4, RF-1, RF-2) ---
-
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=3, max_length=2000)
-
-
-class OfflineToggleRequest(BaseModel):
-    force_offline: bool
-
-
-@router.post("/projects/{pid}/provision")
-async def provision_project(pid: str, db: DBSession):
-    """Idempotent retry for project bank provisioning (HS-4)."""
-    proj = await project_service.provision_project(db, pid)
-    return {
-        "project_id": proj.id,
-        "bank_id": proj.hindsight_bank_id,
-        "bank_status": proj.bank_status,
-    }
-
-
-@router.get("/projects/{pid}/rulebook")
-async def get_rulebook(pid: str, db: DBSession):
-    """Fetch synthesized Project Rulebook (RF-2)."""
-    return await project_service.get_rulebook(db, pid)
-
-
-@router.post("/projects/{pid}/rulebook/refresh")
-async def refresh_rulebook(pid: str, db: DBSession):
-    """Force re-synthesis of Project Rulebook (RF-2)."""
-    return await project_service.refresh_rulebook(db, pid)
-
-
-@router.post("/projects/{pid}/ask")
-async def ask_project(pid: str, body: AskRequest, db: DBSession):
-    """Ask technical question with memory reflection and citation mapping (RF-1)."""
-    return await project_service.ask(db, pid, body.question)
-
-
-@router.get("/admin/hindsight/offline")
-def get_hindsight_offline_status():
-    """Get status of HINDSIGHT_FORCE_OFFLINE toggle (HS-6)."""
-    return {"force_offline": hindsight_gw.is_forced_offline}
-
-
-@router.post("/admin/hindsight/offline")
-def toggle_hindsight_offline(body: OfflineToggleRequest):
-    """Set HINDSIGHT_FORCE_OFFLINE toggle for degradation testing (HS-6)."""
-    hindsight_gw.set_force_offline(body.force_offline)
-    return {"force_offline": hindsight_gw.is_forced_offline}
-
-
-# --- Governed Records, Timeline, Metrics & Seed Endpoints (P3 / RC-1..7, MT-1) ---
-
-class CreateRecordRequest(BaseModel):
-    title: str = Field(..., min_length=3, max_length=255)
-    statement: str = Field(..., min_length=10)
-    memory_type: str = Field(default="architecture_decision")
-    rationale: str | None = None
-    area: str | None = None
-    importance: int = Field(default=3, ge=1, le=5)
-    tags: list[str] = Field(default_factory=list)
-    check_patterns: list[str] = Field(default_factory=list)
-    evidence_quote: str | None = None
-
-
-class SupersedeRecordRequest(BaseModel):
-    title: str = Field(..., min_length=3, max_length=255)
-    statement: str = Field(..., min_length=10)
-    rationale: str | None = None
-    area: str | None = None
-    importance: int = Field(default=3, ge=1, le=5)
-    evidence_quote: str | None = None
-
-
-class RetractRecordRequest(BaseModel):
-    reason: str | None = None
-
-
-class SeedRequest(BaseModel):
-    dataset: str = Field(default="apexcart")  # apexcart, ledgerlite
-
-
-@router.get("/projects/{pid}/records")
-def list_governed_records(
-    pid: str,
-    db: DBSession,
-    status: str | None = None,
-    memory_type: str | None = None,
-    area: str | None = None,
+@router.get("/projects/{pid}/records", tags=["memory"], include_in_schema=False)
+def list_records_alias(
+    pid: str, db: DB, status: str | None = None, memory_type: str | None = None, area: str | None = None
 ):
-    """List governed records for this project with optional status and area filters (RC-1)."""
-    project_or_404(db, pid)
-    query = select(MemoryRecord).where(MemoryRecord.project_id == pid)
-    if status:
-        query = query.where(MemoryRecord.status == status)
-    if memory_type:
-        query = query.where(MemoryRecord.type == memory_type)
-    if area:
-        query = query.where(MemoryRecord.area == area)
-    records = db.scalars(query.order_by(MemoryRecord.importance.desc(), MemoryRecord.decided_at.desc())).all()
-    return [
-        {
-            "id": r.id,
-            "pill": r.pill,
-            "project_id": r.project_id,
-            "type": r.type,
-            "title": r.title,
-            "statement": r.statement,
-            "rationale": r.rationale,
-            "area": r.area,
-            "importance": r.importance,
-            "status": r.status,
-            "confidence_band": r.confidence_band,
-            "supersedes_id": r.supersedes_id,
-            "superseded_by_id": r.superseded_by_id,
-            "hindsight_document_id": r.hindsight_document_id,
-            "retain_state": r.retain_state,
-            "created_at": r.created_at.isoformat(),
-        }
-        for r in records
-    ]
+    return _list_records(db, pid, status, memory_type, area, None)
 
 
-@router.get("/projects/{pid}/records/{rid}")
-def get_governed_record(pid: str, rid: str, db: DBSession):
-    """Fetch complete governed record details including evidence and lineage (RC-1)."""
-    project_or_404(db, pid)
-    rec = db.get(MemoryRecord, rid)
-    if not rec or rec.project_id != pid:
-        raise AppError(code=AppErrorCode.NOT_FOUND, message="Record not found", status_code=404)
-    evidence = [
-        {"id": ev.id, "quote": ev.quote, "speaker": ev.speaker, "turn_index": ev.turn_index}
-        for ev in rec.evidence
-    ]
-    return {
-        "id": rec.id,
-        "pill": rec.pill,
-        "project_id": rec.project_id,
-        "type": rec.type,
-        "title": rec.title,
-        "statement": rec.statement,
-        "rationale": rec.rationale,
-        "area": rec.area,
-        "importance": rec.importance,
-        "status": rec.status,
-        "confidence_band": rec.confidence_band,
-        "supersedes_id": rec.supersedes_id,
-        "superseded_by_id": rec.superseded_by_id,
-        "hindsight_document_id": rec.hindsight_document_id,
-        "retain_state": rec.retain_state,
-        "tags": json.loads(rec.tags_json or "[]"),
-        "check_patterns": json.loads(rec.check_patterns_json or "[]"),
-        "evidence": evidence,
-        "created_at": rec.created_at.isoformat(),
-        "updated_at": rec.updated_at.isoformat(),
-    }
+async def _record_detail(db: Session, pid: str, rid: str) -> dict[str, Any]:
+    svc = services()
+    record = svc.memory.get_record(db, pid, rid)
+    data = record_dto(record, include_content=True)
+    chain: list[dict[str, Any]] = []
+    cursor = record
+    seen = {record.id}
+    while cursor.supersedes_id and cursor.supersedes_id not in seen:
+        prev = db.get(MemoryRecord, cursor.supersedes_id)
+        if not prev:
+            break
+        chain.append(record_ref(prev) | {"relation": "older"})
+        seen.add(prev.id)
+        cursor = prev
+    newer: list[dict[str, Any]] = []
+    cursor = record
+    while cursor.superseded_by_id and cursor.superseded_by_id not in seen:
+        nxt = db.get(MemoryRecord, cursor.superseded_by_id)
+        if not nxt:
+            break
+        newer.append(record_ref(nxt) | {"relation": "newer"})
+        seen.add(nxt.id)
+        cursor = nxt
+    data["version_chain"] = list(reversed(newer)) + [record_ref(record) | {"relation": "this"}] + chain
+
+    applied_runs = []
+    for run in db.scalars(
+        select(TaskRun)
+        .where(TaskRun.project_id == pid, TaskRun.mode == "memory")
+        .order_by(TaskRun.created_at.desc())
+        .limit(200)
+    ).all():
+        brief = loads(run.brief_snapshot_json, {}) or {}
+        if any((a.get("record") or {}).get("id") == rid for a in brief.get("applied") or []):
+            applied_runs.append({"run_id": run.id, "task": run.task[:140], "created_at": iso(run.created_at)})
+    violated = []
+    for check in db.scalars(
+        select(CheckRun).where(CheckRun.project_id == pid).order_by(CheckRun.created_at.desc()).limit(300)
+    ).all():
+        for v in loads(check.violations_json, []):
+            if v.get("record_id") == rid:
+                violated.append(
+                    {"check_id": check.id, "run_id": check.run_id, "excerpt": v.get("excerpt"), "created_at": iso(check.created_at)}
+                )
+    data["applied_in"] = applied_runs[:20]
+    data["violated_in"] = violated[:20]
+    if record.source_session_id:
+        from app.models.entities import AgentSession
+
+        session = db.get(AgentSession, record.source_session_id)
+        if session:
+            data["source_session"] = session_dto(session)
+    data["hindsight_document"] = None
+    if svc.hindsight.available:
+        try:
+            ctx = context_for(get_project(db, pid))
+            doc = await svc.hindsight.get_document(ctx, record.id)
+            AuditService.flush(db, ctx)
+            if doc:
+                data["hindsight_document"] = {
+                    "id": doc.get("id"),
+                    "tags": doc.get("tags"),
+                    "memory_unit_count": doc.get("memory_unit_count"),
+                    "nodes_by_fact_type": doc.get("nodes_by_fact_type"),
+                    "updated_at": doc.get("updated_at"),
+                }
+        except HindsightUnavailable:
+            pass
+    return data
 
 
-@router.post("/projects/{pid}/records", status_code=201)
-async def create_governed_record(pid: str, body: CreateRecordRequest, db: DBSession):
-    """Create and retain a new governed memory record (RC-1)."""
-    project_or_404(db, pid)
-    rec = await mem_service.create_record(
-        db=db,
-        project_id=pid,
+@router.get("/projects/{pid}/memories/{rid}", tags=["memory"])
+async def memory_detail(pid: str, rid: str, db: DB):
+    return await _record_detail(db, pid, rid)
+
+
+@router.get("/projects/{pid}/records/{rid}", tags=["memory"], include_in_schema=False)
+async def record_detail_alias(pid: str, rid: str, db: DB):
+    return await _record_detail(db, pid, rid)
+
+
+async def _create_record(pid: str, body: RecordCreateBody, db: Session) -> dict[str, Any]:
+    record = await services().memory.create_record(
+        db,
+        pid,
         title=body.title,
         statement=body.statement,
-        memory_type=body.memory_type,
+        memory_type=body.kind,
         rationale=body.rationale,
         area=body.area,
-        importance=body.importance,
+        importance=body.importance3,
+        evidence_quote=body.evidence_quote,
         tags=body.tags,
         check_patterns=body.check_patterns,
-        evidence_quote=body.evidence_quote,
+        applies_to=body.applies_to,
+        decided_at=body.decided_at,
+        source=body.source,
+        approved_by=body.reviewer,
     )
-    return {
-        "id": rec.id,
-        "pill": rec.pill,
-        "status": rec.status,
-        "retain_state": rec.retain_state,
-        "title": rec.title,
-    }
+    return record_dto(record)
 
 
-@router.post("/projects/{pid}/records/{rid}/supersede")
-async def supersede_governed_record(pid: str, rid: str, body: SupersedeRecordRequest, db: DBSession):
-    """Execute 5-step supersession protocol (RC-2, RC-3)."""
-    project_or_404(db, pid)
-    new_rec = await mem_service.supersede(
-        db=db,
-        old_record_id=rid,
+@router.post("/projects/{pid}/memories", status_code=201, tags=["memory"])
+async def create_memory(pid: str, body: RecordCreateBody, db: DB):
+    return await _create_record(pid, body, db)
+
+
+@router.post("/projects/{pid}/records", status_code=201, tags=["memory"], include_in_schema=False)
+async def create_record_alias(pid: str, body: RecordCreateBody, db: DB):
+    return await _create_record(pid, body, db)
+
+
+async def _supersede(pid: str, rid: str, body: SupersedeBody, db: Session) -> dict[str, Any]:
+    svc = services()
+    new = await svc.memory.supersede(
+        db,
+        rid,
         title=body.title,
         statement=body.statement,
         rationale=body.rationale,
         area=body.area,
-        importance=body.importance,
+        importance=min(3, body.importance) if body.importance else None,
         evidence_quote=body.evidence_quote,
+        memory_type=body.type,
+        applies_to=body.applies_to,
+        approved_by=body.reviewer,
+        project_id=pid,
     )
+    old = db.get(MemoryRecord, rid)
     return {
+        "record": record_dto(new),
+        "superseded_record": record_dto(old) if old else None,
+        # Legacy keys.
         "status": "superseded",
         "old_record_id": rid,
-        "new_record_id": new_rec.id,
-        "new_pill": new_rec.pill,
+        "new_record_id": new.id,
+        "new_pill": new.pill,
+        **record_dto(new),
     }
 
 
-@router.post("/projects/{pid}/records/{rid}/retract")
-async def retract_governed_record(pid: str, rid: str, body: RetractRecordRequest, db: DBSession):
-    """Retract an obsolete or erroneous record (RC-4)."""
-    project_or_404(db, pid)
-    rec = await mem_service.retract(db=db, record_id=rid, reason=body.reason)
-    return {"status": "retracted", "record_id": rec.id, "pill": rec.pill}
+@router.post("/projects/{pid}/memories/{rid}/supersede", tags=["memory"])
+async def supersede_memory(pid: str, rid: str, body: SupersedeBody, db: DB):
+    return await _supersede(pid, rid, body, db)
 
 
-@router.get("/projects/{pid}/timeline")
-def get_project_timeline(pid: str, db: DBSession, limit: int = 50):
-    """Fetch unified chronological timeline of records, sessions, and audits (MT-1)."""
-    project_or_404(db, pid)
-    return timeline_service.get_timeline(db, pid, limit=limit)
+@router.post("/projects/{pid}/records/{rid}/supersede", tags=["memory"], include_in_schema=False)
+async def supersede_record_alias(pid: str, rid: str, body: SupersedeBody, db: DB):
+    return await _supersede(pid, rid, body, db)
 
 
-@router.get("/projects/{pid}/metrics")
-async def get_project_metrics(pid: str, db: DBSession):
-    """Fetch authoritative §20 governance metrics, distributions, and compliance score (MT-1)."""
-    project_or_404(db, pid)
-    return await metrics_service.get_project_metrics(db, pid)
+@router.post("/projects/{pid}/memories/{rid}/retract", tags=["memory"])
+async def retract_memory(pid: str, rid: str, db: DB, body: RetractBody | None = None):
+    body = body or RetractBody()
+    record = await services().memory.retract(db, rid, body.reason, body.reviewer, project_id=pid)
+    return {**record_dto(record), "record_id": record.id}
 
 
-@router.post("/projects/{pid}/seed")
-async def seed_project_data(pid: str, body: SeedRequest, db: DBSession):
-    """Seed authentic ApexCart or LedgerLite enterprise memories into project (RC-6, RC-7)."""
-    project_or_404(db, pid)
-    return await seed_service.seed_dataset(db, pid, dataset=body.dataset)
+@router.post("/projects/{pid}/records/{rid}/retract", tags=["memory"], include_in_schema=False)
+async def retract_record_alias(pid: str, rid: str, db: DB, body: RetractBody | None = None):
+    return await retract_memory(pid, rid, db, body)
 
 
-@router.post("/projects/{pid}/outbox/flush")
-async def flush_project_outbox(pid: str, db: DBSession):
-    """Flush pending offline outbox messages to Hindsight Cloud (RC-5)."""
-    project_or_404(db, pid)
-    return await mem_service.flush_outbox(db, pid)
+@router.post("/projects/{pid}/memories/{rid}/retry", tags=["memory"])
+async def retry_memory(pid: str, rid: str, db: DB):
+    svc = services()
+    record = svc.memory.get_record(db, pid, rid)
+    record = await svc.memory.retry(db, record)
+    return record_dto(record)
+
+
+@router.post("/projects/{pid}/outbox/flush", tags=["memory"])
+async def flush_outbox(pid: str, db: DB):
+    get_project(db, pid)
+    return await services().memory.flush_outbox(db, pid)
+
+
+# ======================================================== brief / runs / compare
+@router.post("/projects/{pid}/brief", dependencies=RateLimited, tags=["agent"])
+async def brief(pid: str, body: BriefBody, db: DB):
+    result = await services().brief.build_brief(db, pid, body.task, body.file_paths)
+    return result.model_dump()
+
+
+@router.post("/projects/{pid}/runs", dependencies=RateLimited, tags=["agent"])
+async def create_run(pid: str, body: RunBody, db: DB):
+    svc = services()
+    get_project(db, pid)
+    if not getattr(svc.llm, "configured", True):
+        raise AppError(AppErrorCode.LLM_UNAVAILABLE, "Runs need an LLM. Set GROQ_API_KEY on the server.", status_code=503)
+    brief_result = None
+    if body.mode == "memory":
+        brief_result = await svc.brief.build_brief(db, pid, body.task, body.file_paths)
+        if brief_result.status == "memory_unavailable":
+            raise AppError(
+                AppErrorCode.HINDSIGHT_UNAVAILABLE,
+                brief_result.message or "Memory is unavailable; run in baseline mode instead.",
+                status_code=503,
+            )
+    run = await svc.generation.run(db, pid, body.task, body.mode, body.session_id, brief=brief_result)
+    return run.model_dump()
+
+
+@router.get("/projects/{pid}/runs", tags=["agent"])
+def list_runs(pid: str, db: DB, limit: int = Query(30, le=100)):
+    get_project(db, pid)
+    runs = db.scalars(
+        select(TaskRun).where(TaskRun.project_id == pid).order_by(TaskRun.created_at.desc()).limit(limit)
+    ).all()
+    return [run_dto(r) for r in runs]
+
+
+@router.get("/projects/{pid}/runs/{run_id}", tags=["agent"])
+def run_detail(pid: str, run_id: str, db: DB):
+    run = db.get(TaskRun, run_id)
+    if not run or run.project_id != pid:
+        raise not_found("Run")
+    data = run_dto(run)
+    check = db.scalars(select(CheckRun).where(CheckRun.run_id == run_id).order_by(CheckRun.created_at.desc())).first()
+    data["check"] = check_dto(check) if check else None
+    return data
+
+
+@router.post("/projects/{pid}/compare", tags=["agent"], dependencies=RateLimited)
+async def start_compare(pid: str, body: CompareBody, db: DB, wait: bool = False):
+    svc = services()
+    get_project(db, pid)
+    if wait:
+        result = await svc.compare.compare(db, pid, body.task, body.repeats)
+        return result.model_dump()
+    comparison = svc.compare.start(db, pid, body.task, body.repeats)
+    return {"comparison_id": comparison.id, **comparison_dto(comparison)}
+
+
+@router.get("/projects/{pid}/compare", tags=["agent"])
+def list_comparisons(pid: str, db: DB, limit: int = Query(20, le=50)):
+    get_project(db, pid)
+    rows = db.scalars(
+        select(ComparisonRun).where(ComparisonRun.project_id == pid).order_by(ComparisonRun.created_at.desc()).limit(limit)
+    ).all()
+    return [comparison_dto(r) for r in rows]
+
+
+@router.get("/projects/{pid}/compare/{cid}", tags=["agent"])
+async def get_compare(pid: str, cid: str, request: Request, db: DB):
+    svc = services()
+    if "text/event-stream" not in request.headers.get("accept", ""):
+        return svc.compare.load(db, pid, cid).model_dump()
+    row = db.get(ComparisonRun, cid)
+    if not row or row.project_id != pid:
+        raise not_found("Comparison")
+    factory = svc.compare.session_factory
+
+    async def events():
+        last_stage = None
+        for _ in range(1200):  # ~10 minutes max
+            if await request.is_disconnected():
+                return
+            with factory() as session:
+                current = session.get(ComparisonRun, cid)
+                stage, state = current.stage, current.status
+                if stage != last_stage:
+                    last_stage = stage
+                    payload: dict[str, Any] = {"stage": stage, "status": state}
+                    if state in ("completed", "failed"):
+                        payload["result"] = svc.compare.load(session, pid, cid).model_dump()
+                    yield f"event: {stage}\ndata: {json.dumps(payload, default=str)}\n\n"
+                if state in ("completed", "failed"):
+                    return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/projects/{pid}/check", dependencies=RateLimited, tags=["agent"])
+async def memory_check(pid: str, body: CheckBody, db: DB):
+    result = await services().check.check(db, pid, body.content, body.run_id)
+    return result.model_dump()
+
+
+@router.get("/projects/{pid}/checks", tags=["agent"])
+def list_checks(pid: str, db: DB, limit: int = Query(20, le=100)):
+    get_project(db, pid)
+    rows = db.scalars(
+        select(CheckRun).where(CheckRun.project_id == pid).order_by(CheckRun.created_at.desc()).limit(limit)
+    ).all()
+    return [check_dto(c) for c in rows]
+
+
+# ======================================================================= reflect
+@router.post("/projects/{pid}/ask", dependencies=RateLimited, tags=["reflect"])
+async def ask(pid: str, body: AskBody, db: DB):
+    return await services().reflect.ask(db, pid, body.question)
+
+
+@router.get("/projects/{pid}/rulebook", tags=["reflect"])
+async def rulebook(pid: str, db: DB):
+    return await services().reflect.get_rulebook(db, pid)
+
+
+@router.post("/projects/{pid}/rulebook/refresh", tags=["reflect"])
+async def rulebook_refresh(pid: str, db: DB):
+    return await services().reflect.refresh_rulebook(db, pid)
+
+
+@router.get("/projects/{pid}/rulebook/history", tags=["reflect"])
+async def rulebook_history(pid: str, db: DB):
+    return await services().reflect.history(db, pid)
+
+
+@router.get("/projects/{pid}/rulebook/export", tags=["reflect"])
+def rulebook_export(pid: str, db: DB, format: str = "claude_md"):
+    return services().reflect.export(db, pid, "cursorrules" if format == "cursorrules" else "claude_md")
+
+
+# ============================================================ timeline / metrics
+@router.get("/projects/{pid}/timeline", tags=["insights"])
+def timeline(pid: str, db: DB, limit: int = Query(100, le=300)):
+    get_project(db, pid)
+    return services().timeline.get_timeline(db, pid, limit=limit)
+
+
+@router.get("/projects/{pid}/metrics", tags=["insights"])
+async def metrics(pid: str, db: DB):
+    get_project(db, pid)
+    return await services().metrics.get_project_metrics(db, pid)
+
+
+@router.get("/projects/{pid}/audit", tags=["insights"])
+def audit(pid: str, db: DB, type: str | None = None, limit: int = Query(100, le=500)):
+    get_project(db, pid)
+    query = select(AuditEvent).where(AuditEvent.project_id == pid)
+    if type:
+        query = query.where(AuditEvent.event_type == type)
+    rows = db.scalars(query.order_by(AuditEvent.created_at.desc()).limit(limit)).all()
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "status": e.status,
+            "latency_ms": e.latency_ms,
+            "record_id": e.record_id,
+            "run_id": e.run_id,
+            "actor": e.actor,
+            "detail": loads(e.detail_json, {}),
+            "created_at": iso(e.created_at),
+        }
+        for e in rows
+    ]
+
+
+@router.post("/projects/{pid}/eval", dependencies=RateLimited, tags=["insights"])
+async def run_eval(pid: str, db: DB, body: EvalBody | None = None):
+    return await services().eval.run(db, pid, (body or EvalBody()).set)
+
+
+@router.get("/projects/{pid}/eval", tags=["insights"])
+def list_evals(pid: str, db: DB):
+    get_project(db, pid)
+    rows = db.scalars(
+        select(EvalRun).where(EvalRun.project_id == pid).order_by(EvalRun.created_at.desc()).limit(10)
+    ).all()
+    return [EvalService.dto(r) for r in rows]
+
+
+# ========================================================================= admin
+@router.post("/admin/seed", dependencies=[Depends(require_demo_mode)], tags=["admin"])
+async def admin_seed(body: SeedBody, db: DB):
+    return await services().seed.seed(db, body.project, reset=body.reset)
+
+
+@router.post("/projects/{pid}/seed", dependencies=[Depends(require_demo_mode)], tags=["admin"])
+async def seed_project(pid: str, body: DatasetBody, db: DB):
+    return await services().seed.seed_dataset(db, pid, body.dataset)
+
+
+@router.post("/projects/{pid}/reset", dependencies=[Depends(require_demo_mode)], tags=["admin"])
+async def reset_project(pid: str, db: DB):
+    project = get_project(db, pid)
+    await services().seed.reset_project(db, project)
+    return {"status": "reset", "project_id": pid}
+
+
+@router.get("/admin/hindsight/offline", tags=["admin"])
+def get_offline():
+    return {"force_offline": services().hindsight.is_forced_offline}
+
+
+@router.post("/admin/hindsight/offline", dependencies=[Depends(require_demo_mode)], tags=["admin"])
+def set_offline(body: OfflineBody):
+    services().hindsight.set_force_offline(body.force_offline)
+    return {"force_offline": services().hindsight.is_forced_offline}

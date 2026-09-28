@@ -1,36 +1,33 @@
-﻿# ProjectPulse MCP-first architecture
+# ProjectPulse architecture
 
 ```text
-Coding agent (Claude Code / Copilot / MCP CLI)
-  -> MCP stdio server: three focused tools
-  -> project_memory_service
-      -> project_id lookup in PostgreSQL/Supabase
-      -> Hindsight Cloud bank for that project (real mode)
-      -> demo_memories table for that project (explicit demo mode)
-      -> audit_event_service -> sessions, memory_events, agent_activity
-  -> coding agent continues with only retrieved facts
-
-React dashboard -> FastAPI -> same project_memory_service + audit database
+React SPA (8 screens) ─┐                         ┌─ HindsightGateway ── Hindsight Cloud (one bank per project)
+                       ├─ FastAPI routers ─ services ─┤
+MCP agents (stdio) ────┘   (validate, delegate)   └─ LLMGateway ─────── Groq / OpenAI-compatible
+                                   │
+                                   └── SQLAlchemy ── PostgreSQL / SQLite (governance, runs, audit)
 ```
 
-The MCP stdio entry point is `projectpulse-mcp/server.py`. The registered tools live in `backend/app/services/mcp_server.py` so the local in-memory MCP demo and the separate stdio process use identical tool definitions. The API never handles raw MCP transport messages.
+## Layers
 
-## Project isolation
+| Layer | Modules | Rule |
+| --- | --- | --- |
+| Core | `config`, `core/errors`, `core/security`, `core/logging`, `core/context`, `core/ratelimit`, `core/tokens`, `core/taxonomy`, `core/secrets`, `core/memory_conventions` | Settings from env; error envelope; JSON logs with request IDs; ID/tag/metadata conventions |
+| Gateways | `gateways/hindsight_gateway.py`, `gateways/llm_gateway.py`, `gateways/project_context.py` | The only code that calls Hindsight or the LLM. Isolation, timeouts, retries, hedged recall, audit events on the `ProjectContext` |
+| Services | `project`, `session`, `extraction` (+ `extraction_validator`, `signals`, `transcript_parser`, `heuristics`), `review`, `governed_memory`, `brief`, `generation`, `check`, `compare`, `reflect`, `timeline`, `metrics`, `eval`, `seed`, `audit`, `container` | Business logic; no HTTP; persist audit events with the caller's DB session |
+| Jobs | `jobs/retry_worker.py` | Outbox retry every 30 s with exponential backoff (≤ 8 attempts) + startup reconciler |
+| API | `api/v1/endpoints.py`, `api/v1/schemas.py`; legacy `api/routes.py` | Routers validate and delegate; request models ignore unknown fields (no client bank IDs) |
+| Prompts | `prompts/templates.py`, `prompts/schemas.py` | Versioned prompts next to their Pydantic output schemas |
+| MCP | `services/mcp_server.py`, `projectpulse-mcp/server.py` | Governed tools share the dashboard services |
 
-`projects.hindsight_bank_id` is the only bank chosen for a given project UUID. In real mode, retain and recall include the immutable `project:{uuid}` tag; recall uses a strict tag match in that bank. List uses the same bank and project tag. A caller cannot supply a bank ID or override the project tag. Session IDs are checked against the selected project. Demo mode uses a separate, clearly prefixed bank mapping and queries `demo_memories` by project ID; it never calls Hindsight.
+## Data (PostgreSQL / SQLite)
 
-Real Hindsight memory is not reconstructed from `memory_events`. That table is an audit trail, while Hindsight owns the long-term searchable memory. The local demo table is used only for projects explicitly created without credentials and is not presented as Hindsight.
+`projects` (bank mapping, bank status, Rulebook cache) · `agent_sessions` + `session_turns` (transcripts, never retained into Hindsight) · `memory_candidates` · `memory_records` (+ `record_evidence`, version chain, `retain_state` outbox) · `task_runs` (frozen recall snapshot, tokens, latencies) · `check_runs` · `comparison_runs` · `audit_events` (every Hindsight/LLM call with latency, isolation blocks) · `rulebook_snapshots` · `eval_runs`. Schema is synced additively at startup (new tables/columns only, never destructive).
 
-## Call flow
+## Key flows
 
-1. A new project creates a Hindsight bank if a key is configured; otherwise it receives a `demo-` bank mapping.
-2. `retain_project_memory` validates type, tags, source/session, and obvious credential patterns. It sends the fact to Hindsight Retain or local demo storage, then writes a retained event and activity audit.
-3. `recall_project_memory` validates the project, retrieves only task-relevant facts, creates a fresh agent session, and writes task/tool/evidence audit entries. It returns memory ID, content, type, tags, source/session, timestamp, and origin.
-4. `list_project_memories` reads Hindsight's bank-scoped memory-unit list endpoint or the local demo table, with optional type/tag filters.
-5. The dashboard reads the memory list, timeline, and activity. Its judge-facing button uses the official MCP Client against the same registered server object; `demo_cli.py` proves the separate stdio transport too.
-
-The local sample code result after the demo recall is deterministic and labelled. It is not an external agent output. The old Groq comparison route remains available but is not part of the MCP-first path.
-
-## Security and limits
-
-Secrets stay in backend environment variables. The frontend receives no provider key. MCP tools require a project UUID and cannot choose arbitrary banks. The API is unauthenticated for the hackathon and must be protected before public deployment. The list endpoint currently shows up to 100 recent memory units; add pagination for larger projects. SQLAlchemy creates tables at startup, but production deployments should add migrations.
+- **Memory formation:** import/close session → extract (LLM or labelled heuristic) → validator → relate (Hindsight recall top 5 per candidate) → Inbox → approve → record `pending` → retain → `retained` (failures → `failed` + backoff → worker).
+- **Supersession:** create B (supersedes A, "Replaces the decision of …") → A `superseded` + `retag_pending` → Documents API retag → `retained`. Recall excludes A by tag group and by PostgreSQL post-filter.
+- **Brief:** zero active records → no recall · recall (hedged) → group by record → status post-filter → applicability (reason per record) → ≤ 5 importance-first → `<project_memory>` block with measured tokens.
+- **Compare:** create row → background task → brief once, generate baseline and memory in parallel (separate DB sessions, repeats 1 or 3) → blind checks in parallel → summary + fairness line; SSE streams stage changes.
+- **Degradation:** Hindsight unavailable → brief/check/ask `unavailable`, approvals `pending` ("Waiting to sync"), Rulebook from cache, baseline still runs; bank 404 → project `error` with Reprovision.

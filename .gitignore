@@ -12,3 +12,5 @@ frontend/.vite/
 *.tsbuildinfo
 *.rej
 *.orig
+*.db-shm
+*.db-wal

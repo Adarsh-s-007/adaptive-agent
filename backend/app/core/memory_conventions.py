@@ -1,11 +1,21 @@
-"""Canonical conventions for Hindsight document IDs, tags, metadata, and templates (C-4)."""
+"""Canonical conventions for Hindsight document IDs, tags, metadata and content (Blueprint §4.1, §15.3)."""
 
 from __future__ import annotations
 
+from datetime import datetime
+
+RETAIN_CONTEXT = "approved engineering decision record for software project {name}"
+
 
 def format_document_id(record_id: str) -> str:
-    """Format Hindsight document ID: 'mem_<record_id>'."""
+    """One record = one Hindsight document: `mem_<record_id>` (idempotent retain)."""
     return f"mem_{record_id}"
+
+
+def record_id_from_document(document_id: str | None) -> str | None:
+    if document_id and document_id.startswith("mem_"):
+        return document_id[4:]
+    return None
 
 
 def build_tags(
@@ -16,21 +26,21 @@ def build_tags(
     confidence_band: str = "high",
     extra_tags: list[str] | None = None,
 ) -> list[str]:
-    """Build normalized tag set for Hindsight storage and recall."""
-    tags = [
-        f"project:{project_id}",
-        f"type:{memory_type}",
-        f"status:{status}",
-    ]
+    """Tag set stored on every document. `project:` and `status:` drive recall filtering."""
+    tags = [f"project:{project_id}", f"type:{memory_type}", f"status:{status}"]
     if area:
         tags.append(f"area:{area}")
     if confidence_band == "low":
         tags.append("confidence:low")
-    if extra_tags:
-        for t in extra_tags:
-            clean = t.strip().lower()
-            if clean and not clean.startswith("project:") and clean not in tags:
-                tags.append(clean)
+    for tag in extra_tags or []:
+        clean = tag.strip().lower()
+        if (
+            clean
+            and not clean.startswith(("project:", "status:", "type:"))
+            and clean not in tags
+            and len(clean) <= 60
+        ):
+            tags.append(clean)
     return tags
 
 
@@ -44,7 +54,7 @@ def build_metadata(
     supersedes: str | None = None,
     stated_by: str | None = None,
 ) -> dict[str, str]:
-    """Build Hindsight metadata dictionary where all values are strings."""
+    """Hindsight metadata: strings only, empty strings for absent values (§15.3)."""
     return {
         "record_id": str(record_id),
         "project_id": str(project_id),
@@ -58,10 +68,8 @@ def build_metadata(
 
 
 def format_context_string(project_name: str, area: str | None = None) -> str:
-    """Format contextual description for memory retention and reflection."""
-    if area:
-        return f"Engineering record for {project_name} within subsystem '{area}'."
-    return f"Engineering record for {project_name}."
+    """Kept constant per project because context shapes Hindsight's extraction."""
+    return RETAIN_CONTEXT.format(name=project_name)
 
 
 def render_record_content(
@@ -71,18 +79,34 @@ def render_record_content(
     rationale: str | None = None,
     area: str | None = None,
     supersedes_ref: str | None = None,
+    *,
+    project_name: str | None = None,
+    applies_to: list[str] | None = None,
+    decided_at: datetime | None = None,
+    session_title: str | None = None,
+    decided_by: str | None = None,
+    status: str = "active",
 ) -> str:
-    """Render canonical content template per Blueprint §4.1."""
-    parts = [
-        f"[{memory_type}] {title.strip()}",
-        "",
-        "Rule / Decision:",
-        statement.strip(),
-    ]
+    """Render the fixed record template that becomes the Hindsight document text."""
+    header = f"[{memory_type}] {title.strip()}"
+    if project_name:
+        header += f" — {project_name}"
+    lines = [header, f"Rule: {statement.strip()}"]
     if rationale and rationale.strip():
-        parts.extend(["", "Rationale & Context:", rationale.strip()])
-    if area and area.strip():
-        parts.extend(["", f"Applied scope: {area.strip()}"])
+        lines.append(f"Rationale: {rationale.strip()}")
+    scope = [s for s in (applies_to or []) if s]
+    if scope:
+        lines.append(f"Applies to: {', '.join(scope)}.")
+    elif area and area.strip():
+        lines.append(f"Applies to: {area.strip()}.")
+    if decided_at:
+        decided = f"Decided: {decided_at.date().isoformat()}"
+        if session_title:
+            decided += f' in session "{session_title}"'
+        if decided_by:
+            decided += f" by {decided_by}"
+        lines.append(decided + ".")
+    lines.append(f"Status: {status}.")
     if supersedes_ref and supersedes_ref.strip():
-        parts.extend(["", f"Replaces the decision of: {supersedes_ref.strip()}"])
-    return "\n".join(parts)
+        lines.append(f"Replaces the decision of {supersedes_ref.strip()}")
+    return "\n".join(lines)

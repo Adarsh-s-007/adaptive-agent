@@ -1,11 +1,14 @@
 // Kept free of three.js imports so the main bundle can decide whether to load the 3D chunks.
 
 export const MEMORY_TYPE_COLORS: Record<string, string> = {
-  architecture_decision: "#8d7cff",
-  security_rule: "#ff7a9c",
-  api_contract: "#52d9ca",
-  incident_fix: "#eab96a",
-  coding_convention: "#6aa8ff",
+  decision: "#8d7cff",
+  security_constraint: "#ff6b8b",
+  convention: "#5aa9ff",
+  api_contract: "#35d6c5",
+  incident: "#ffb454",
+  failed_approach: "#ff8f5e",
+  deployment: "#b58cff",
+  preference: "#8fd46b",
 };
 
 export const MEMORY_TYPES = Object.keys(MEMORY_TYPE_COLORS);

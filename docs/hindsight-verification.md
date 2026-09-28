@@ -1,44 +1,28 @@
-# Hindsight Memory Space Live Verification Report
+# Hindsight verification record (Blueprint §15.9)
 
-**Standard:** ProjectPulse Master Blueprint §15.9 (HS-1 Compliance)
-**Verification Date:** 2026-09-28T18:06:00.946587+00:00
-**Provider:** Hindsight Cloud (`api.hindsight.vectorize.io/v1/default`)
-**Gateway Class:** `app.gateways.hindsight_gateway.HindsightGateway`
-**Test Bank ID:** `pp_test_verify_34ac2f34` (Cleanly torn down)
-**Status:** **100% PASSED (LIVE CLOUD VERIFIED)**
+Verified live against **Hindsight Cloud API 0.10.1** (`https://api.hindsight.vectorize.io`, OpenAPI spec pulled on 2026-09-29) on throwaway banks `pp_probe_*`, all deleted afterwards.
 
----
+| Item | Result | What ProjectPulse does |
+| --- | --- | --- |
+| Base URL + bearer auth | `GET /v1/default/banks?limit=1` → 200 | Health probe with a 3 s timeout |
+| `PUT /banks/{id}` | 200; `name`, `reflect_mission` accepted (mission/disposition fields on this route are deprecated) | Create bank, then configure via `PATCH /config` |
+| `PATCH /banks/{id}/config` `{updates:{…}}` | 200; `retain_extraction_mode: verbatim`, missions, dispositions, `enable_observations` all applied | Sent on provisioning |
+| Memory Defense (`memory_defense.sensitive_data`) | **400 `detectors_not_entitled`** on this plan | Gateway retries config without it; ProjectPulse validator redaction always applies |
+| Directives `POST /directives` | 200 | 3 guardrails, idempotent by name |
+| Mental model `POST /mental-models` with `id: rulebook`, `trigger.refresh_after_consolidation` | 200 + `operation_id`; content `"Generating content..."` until the first refresh completes | Rulebook shows a *generating* state; `trigger.tag_groups` excludes superseded/retracted |
+| Mental model refresh / get | refresh queued (200); content arrives ~10–15 s later | Overview polls while generating; content cached with timestamp |
+| Mental model history | `[]` after one refresh | ProjectPulse stores its own `rulebook_snapshots` for *What changed* |
+| Sync retain with `document_id`, `timestamp`, `context`, `tags`, `metadata`, `entities` | 200 in ~2.6 s; document metadata and retain params stored | One record = one document `mem_<record_id>` |
+| Recall with `tag_groups` (`project` leaf AND `not status:superseded/retracted`) | Works — superseded documents excluded | Used for Brief, Check and Relate |
+| Document retag `PATCH /documents/{id}` `{tags}` | 200 `{success:true}`; tags replaced, derived units follow | Supersede/retract step 2 |
+| Recall of a missing bank | 404 `Bank '…' not found` | `BankMissing` → project `error`, Reprovision offered |
+| Reflect with `include.facts` and `tag_groups` | 200; `based_on.memories` are memory-unit IDs (no `document_id`), `based_on.directives` listed | Units resolved via `GET /memories/{id}` → `document_id` / metadata → record |
+| Observations | Returned as `type: observation` with the source documents' tags; `source_fact_ids` only with `include.source_facts` | Requested with `source_facts`; mapped back to records |
 
-## 1. Verification Test Matrix
+## Reliability finding: empty recall responses
 
-| Step | Operation | Target / Input | Expected Result | Live Result | Status |
-|---|---|---|---|---|---|
-| 1 | Health Probe | `GET /v1/default/banks?limit=1` | HTTP 200, latency < 500ms | 200 OK, latency ~50ms | **PASS** |
-| 2 | Bank Provisioning | `PUT /v1/default/banks/{bank_id}` | Bank created with retain & reflect missions | Status `ready` | **PASS** |
-| 3 | Directives Setup | `POST /v1/default/banks/{bank_id}/directives` | 3 core directives attached (`cite_decisions`, `obsolete_superseded`, `no_secrets`) | 3 directives active | **PASS** |
-| 4 | Mental Model | `POST /v1/default/banks/{bank_id}/mental-models` | Rulebook mental model provisioned | Mental model ID returned | **PASS** |
-| 5 | Retain Memories | `POST /v1/default/banks/{bank_id}/memories` | 5 governed records across diverse areas (`cart`, `networking`, `database`, `architecture`, `auth`) | 5 items retained with UUIDv7 IDs | **PASS** |
-| 6 | Recall (Unfiltered) | `POST /v1/default/banks/{bank_id}/memories/recall` | Semantic matching with score > 0.40 | Recalled 10 facts | **PASS** |
-| 7 | Document Retagging | `PATCH /v1/default/banks/{bank_id}/documents/{doc_id}` | Tag updated to `status:superseded` | HTTP 200 `success: true` | **PASS** |
-| 8 | Recall (Filtered) | `recall(..., exclude_status=['superseded'])` | Exclude superseded memories | Superseded record excluded | **PASS** |
-| 9 | Isolation Boundary | `ProjectContext.assert_record_isolated()` | Foreign project record blocked | Violation counted & dropped | **PASS** |
-| 10 | Reflection / Ask | `POST /v1/default/banks/{bank_id}/reflect` | Synthesis respecting directives | Architectural answer generated | **PASS** |
-| 11 | Bank Teardown | `DELETE /v1/default/banks/{bank_id}` | Temporary bank deleted | HTTP 200 OK | **PASS** |
+Identical recalls against an unchanged bank returned **0 results ~40% of the time** (40 calls over 100 s: 24 non-empty, 16 empty; empties are fast, ~370 ms), independent of filters. `HindsightGateway.recall_detailed` therefore, when the bank is known to hold active records, fires **two hedged requests per round for up to three rounds** and records `attempts` in the `RECALL` audit event. With independent failures the chance of a false "no memory" drops to well under 1%.
 
----
+## End-to-end run (live)
 
-## 2. Retained Memories Sample Log
-
-1. **Architecture Decision (`cart`):** Redis cluster with 48h TTL for cart state.
-2. **Coding Standard (`networking`):** Mandatory explicit timeouts on HTTP clients.
-3. **Architecture Decision (`database`):** PostgreSQL 16 with PgBouncer.
-4. **Dependency Rule (`architecture`):** Domain boundary gateway isolation.
-5. **Security Constraint (`auth`):** Sanitize logs and redact Authorization tokens.
-
----
-
-## 3. Security & Isolation Verification
-
-- **API Key Security:** Live key `HINDSIGHT_API_KEY` stored exclusively in local `.env` (gitignored). No keys committed to git.
-- **Project Boundary Protection:** Every memory record carries `metadata.project_id` and tag `project:{project_id}`. Recalls filter on `tags: ["project:{project_id}"]` with strict local verification. Foreign project records are immediately dropped and increment `isolation_violations_blocked`.
-- **Forced Offline Toggle:** Supports `HINDSIGHT_FORCE_OFFLINE=true` via environment or runtime switch for resilient local degradation.
+Seed ApexCart (13 records, async retain) → Brief (recall ~1 s) → extract S-104 (2 candidates, 6 filtered) → approve both (retained) → extract S-131 (supersedes + duplicate) → LedgerLite brief returns only LedgerLite's rules → Check flags `new PrismaClient()`, `localStorage.setItem('token', …)`, PII logging → Ask cites the Redis failed-approach record → Rulebook generated → isolation counter 0.
