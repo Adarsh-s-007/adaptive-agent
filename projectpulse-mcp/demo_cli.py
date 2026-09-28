@@ -1,4 +1,4 @@
-﻿"""Real MCP stdio tool-call demo; the sample coding result is labelled."""
+"""Real MCP stdio tool-call demo; the sample coding result is labelled."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from mcp import Client
 from mcp.client.stdio import StdioServerParameters
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db.database import SessionLocal
 from app.models.entities import AgentSession, Project
 from app.services.audit_event_service import AuditEventService
@@ -34,10 +35,16 @@ async def main(project_id: str | None) -> None:
             raise SystemExit("Create or launch the E-commerce project first.")
         project_id = project.id
 
+    settings = get_settings()
+    forwarded_env = {"DATABASE_URL": settings.database_url}
+    if settings.hindsight_api_key:
+        forwarded_env["HINDSIGHT_API_KEY"] = settings.hindsight_api_key
+        forwarded_env["HINDSIGHT_BASE_URL"] = settings.hindsight_base_url
     params = StdioServerParameters(
         command=sys.executable,
         args=[str(ROOT / "projectpulse-mcp" / "server.py")],
         cwd=str(ROOT),
+        env=forwarded_env,
     )
     async with Client(params) as client:
         print("Actual MCP tool call: projectpulse.recall_project_memory")
@@ -106,4 +113,3 @@ if __name__ == "__main__":
     parser.add_argument("--project-id", help="Defaults to E-commerce Platform")
     args = parser.parse_args()
     asyncio.run(main(args.project_id))
-

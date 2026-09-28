@@ -28,7 +28,10 @@ async def recall_project_memory(
     """Recall only task-relevant memories from this project's isolated bank."""
     with SessionLocal() as db:
         return await service.recall(
-            db, project_id, task_description, top_k,
+            db,
+            project_id,
+            task_description,
+            top_k,
             source_agent="Fresh Agent B",
         )
 

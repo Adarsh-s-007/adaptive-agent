@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import uuid
@@ -355,7 +355,9 @@ async def run_mcp_demo(project_id: str, db: DBSession):
         try:
             payload = json.loads(result.content[0].text)
         except (IndexError, AttributeError, ValueError) as exc:
-            raise HTTPException(502, "The MCP tool returned no structured result.") from exc
+            raise HTTPException(
+                502, "The MCP tool returned no structured result."
+            ) from exc
     memories = payload.get("memories", [])
     jwt_seen = any(
         "http-only" in item.get("text", "").lower()
@@ -376,8 +378,13 @@ async def run_mcp_demo(project_id: str, db: DBSession):
         )
     session = db.get(AgentSession, payload["session_id"])
     AuditEventService.activity(
-        db, project, session, "agent_result", sample,
-        payload["origin"], evidence=memories,
+        db,
+        project,
+        session,
+        "agent_result",
+        sample,
+        payload["origin"],
+        evidence=memories,
     )
     db.commit()
     return {
@@ -505,7 +512,3 @@ async def seed(project_id: str, db: DBSession):
             else "Hindsight connected"
         ),
     }
-
-
-
-

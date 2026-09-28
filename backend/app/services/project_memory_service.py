@@ -1,4 +1,4 @@
-﻿"""Project-scoped memory orchestration for MCP tools and dashboard API."""
+"""Project-scoped memory orchestration for MCP tools and dashboard API."""
 
 from __future__ import annotations
 
@@ -397,5 +397,3 @@ class ProjectMemoryService:
             else "Hindsight connected",
             "used_bank_id": project.hindsight_bank_id,
         }
-
-

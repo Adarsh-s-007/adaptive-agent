@@ -1,9 +1,11 @@
-﻿"""ProjectPulse contract and end-to-end API tests with provider boundaries stubbed."""
+"""ProjectPulse contract and end-to-end API tests with provider boundaries stubbed."""
 
+import asyncio
 import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -14,12 +16,14 @@ os.environ["DATABASE_URL"] = "sqlite:///" + str(
 os.environ["HINDSIGHT_API_KEY"] = "test-hindsight-key"
 os.environ["GROQ_API_KEY"] = "test-groq-key"
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.api import routes
-from app.db.database import engine
-from app.services import mcp_server
+from app.db.database import SessionLocal, engine
 from app.main import app
+from app.models.entities import Project
+from app.services import mcp_server
 from app.services.groq_service import GroqService
 from app.services.hindsight_service import HindsightService
 
@@ -59,12 +63,15 @@ class FakeHindsight:
     async def list_memories(self, bank_id, project_id, memory_type=None, tag=None):
         items = [
             {
-                "id": item["document_id"], "text": item["content"],
+                "id": item["document_id"],
+                "text": item["content"],
                 "type": item["metadata"]["memory_type"],
-                "tags": item["tags"], "metadata": item["metadata"],
+                "tags": item["tags"],
+                "metadata": item["metadata"],
                 "source_agent": item["metadata"]["source_agent"],
                 "session_id": item["metadata"].get("session_id"),
-                "timestamp": "2026-09-28T10:00:00Z", "origin": "hindsight",
+                "timestamp": "2026-09-28T10:00:00Z",
+                "origin": "hindsight",
             }
             for item in self.banks[bank_id]
             if (not memory_type or item["metadata"]["memory_type"] == memory_type)
@@ -236,11 +243,91 @@ class FlowTests(unittest.TestCase):
         self.assertIn("HTTP-only", mcp_demo.json()["memories"][0]["text"])
         self.assertIn("not an external coding agent", mcp_demo.json()["sample_result"])
         activity = self.client.get(f"/projects/{ecom['id']}/activity").json()
-        self.assertTrue(any(
-            item["tool_name"] == "projectpulse.recall_project_memory"
-            for item in activity
-        ))
+        self.assertTrue(
+            any(
+                item["tool_name"] == "projectpulse.recall_project_memory"
+                for item in activity
+            )
+        )
         self.assertTrue(any(item["kind"] == "agent_result" for item in activity))
+
+
+class DemoModeTests(unittest.TestCase):
+    def test_local_memory_is_labelled_relevant_and_project_scoped(self):
+        first_id, second_id = str(uuid.uuid4()), str(uuid.uuid4())
+        with SessionLocal() as db:
+            db.add(
+                Project(
+                    id=first_id,
+                    name="Demo Checkout " + first_id[:8],
+                    description="Local sample",
+                    hindsight_bank_id="demo-" + first_id,
+                )
+            )
+            db.add(
+                Project(
+                    id=second_id,
+                    name="Demo Checkout " + second_id[:8],
+                    description="Other project",
+                    hindsight_bank_id="demo-" + second_id,
+                )
+            )
+            db.commit()
+            service = routes.memory_service
+            saved = asyncio.run(
+                service.retain(
+                    db,
+                    first_id,
+                    "Refresh tokens use HTTP-only Secure cookies, not LocalStorage.",
+                    "security_rule",
+                    ["authentication"],
+                    "Agent A",
+                )
+            )
+            self.assertEqual(saved["origin"], "demo")
+            self.assertIn("Demo mode", saved["mode_label"])
+            found = asyncio.run(
+                service.recall(db, first_id, "Implement refresh token login", 5)
+            )
+            self.assertEqual(len(found["memories"]), 1)
+            self.assertEqual(found["memories"][0]["origin"], "demo")
+            unrelated = asyncio.run(
+                service.recall(
+                    db, first_id, "Improve footer typography and keyboard focus", 5
+                )
+            )
+            self.assertEqual(unrelated["memories"], [])
+            isolated = asyncio.run(
+                service.recall(db, second_id, "Implement refresh token login", 5)
+            )
+            self.assertEqual(isolated["memories"], [])
+            filtered = asyncio.run(
+                service.list_memories(db, first_id, "security_rule", "authentication")
+            )
+            self.assertEqual(filtered["count"], 1)
+            empty = asyncio.run(service.list_memories(db, first_id, tag="payments"))
+            self.assertEqual(empty["count"], 0)
+            with self.assertRaises(HTTPException):
+                asyncio.run(
+                    service.recall(
+                        db,
+                        second_id,
+                        "Implement login",
+                        5,
+                        session_id=found["session_id"],
+                    )
+                )
+            with self.assertRaises(HTTPException):
+                asyncio.run(
+                    service.retain(
+                        db,
+                        first_id,
+                        "password=supersecret is the new default.",
+                        "security_rule",
+                        [],
+                        "Agent A",
+                    )
+                )
 
 
 class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
@@ -279,6 +366,36 @@ class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(memories[0]["timestamp"], "2026-09-28T10:00:00Z")
 
+    async def test_hindsight_list_uses_project_tag_and_filters(self):
+        service = HindsightService()
+        service._request = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "id": "fact-1",
+                        "text": "Use HttpOnly cookies.",
+                        "metadata": {
+                            "memory_type": "security_rule",
+                            "source_agent": "Agent A",
+                        },
+                        "tags": ["project:project-1", "authentication"],
+                    }
+                ],
+                "total": 1,
+                "limit": 100,
+                "offset": 0,
+            }
+        )
+        items = await service.list_memories(
+            "bank-1", "project-1", "security_rule", "authentication"
+        )
+        self.assertEqual(len(items), 1)
+        params = service._request.await_args.kwargs["params"]
+        self.assertIn(("tags", "project:project-1"), params)
+        self.assertIn(("tags", "authentication"), params)
+        self.assertIn(("tags_match", "all_strict"), params)
+        self.assertEqual(items[0]["origin"], "hindsight")
+
     async def test_groq_selector_can_abstain(self):
         service = GroqService()
         service._complete = AsyncMock(return_value='{"selected":[]}')
@@ -291,4 +408,3 @@ class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

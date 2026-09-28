@@ -1,63 +1,46 @@
-﻿# ProjectPulse — Cross-Agent Engineering Memory
+﻿# ProjectPulse - project-scoped MCP memory for coding agents
 
-**One-line pitch:** Give every coding agent the project decisions it needs from Hindsight before it starts a task.
+**Pitch:** A coding agent can recall the engineering decisions relevant to its next task, even in a fresh session. ProjectPulse is an MCP memory server powered by Hindsight, with a companion dashboard for inspecting memory and agent activity.
 
-Coding agents lose useful engineering context between sessions. ProjectPulse retains decisions, conventions, bug fixes, and failed approaches in a bank dedicated to one project. A fresh agent recalls a small, relevant set and answers with the prior decisions in view. The dashboard makes the generic and memory-aware answers easy to compare.
+The primary product is `projectpulse-mcp`. The dashboard is an evidence viewer and admin surface, not a coding agent. The included local demo makes a real MCP tool call; its sample coding result is explicitly labelled and is not Claude Code or Copilot.
 
 ## Architecture
 
 ```text
-React + Vite dashboard
-         |
-         v
-FastAPI ------ PostgreSQL / Supabase (project metadata and audit timeline)
-   |  |
-   |  +------ Groq (relevance check and two comparison answers)
-   |
-   +--------- Hindsight Cloud (isolated project banks, Retain and Recall)
+Claude Code / Copilot / MCP CLI
+          |
+          | stdio MCP: recall_project_memory, retain_project_memory,
+          |            list_project_memories
+          v
+projectpulse-mcp --> project_memory_service --> Hindsight Cloud
+                             |                     one isolated bank/project
+                             +--> PostgreSQL/Supabase
+                                  project mapping, sessions, audit activity
+                             +--> local demo memory (only for demo-mode projects)
+
+React dashboard --> FastAPI --> same shared services and audit database
 ```
 
-See [architecture.md](docs/architecture.md) for the bank boundary and request flow. The dashboard is the screenshot-ready demo surface; add captured screenshots to `docs/screenshots/` after configuring live services.
+See [architecture.md](docs/architecture.md). No unrestricted database access is given to an LLM.
 
-## Stack
+## What is real, and what is demo mode?
 
-- React 18, TypeScript, Vite
-- Python, FastAPI, SQLAlchemy, PostgreSQL or Supabase PostgreSQL
-- Hindsight Cloud for durable project memory
-- Groq chat completions for task relevance and answers
+With `HINDSIGHT_API_KEY` configured, new projects receive Hindsight banks. Retain posts durable facts to that bank. Recall asks only that bank, with a strict project tag. List reads Hindsight memory units from that bank. The dashboard displays provider-backed evidence and local audit records.
 
-## What the memory operations do
+Without the key, new projects use **Demo mode - local sample memory**. The five primary E-commerce facts plus three supporting facts are stored in a project-scoped local demo table. This mode is visibly labelled throughout the UI and MCP responses; it does **not** pretend to be Hindsight. Its relevance matching is simple keyword overlap, not Hindsight retrieval. Existing demo-mode projects stay in demo mode if a key is added later; create a new project/database for a real-bank demo.
 
-**Retain:** The API validates a project, builds a stable document ID, and posts the learning to that project's Hindsight bank with a timestamp, project/type tags, and source-agent metadata. It writes a separate audit event to PostgreSQL after Hindsight confirms the operation. Demo seeding uses deterministic document IDs so reruns do not duplicate memory.
+Groq is optional for the MCP-first flow. The original `/agent-answer` comparison endpoint remains for compatibility and requires Groq and Hindsight; the dashboard now focuses on actual MCP activity.
 
-**Recall:** The API sends the current task to that project's bank with a strict project tag filter. It requests a compact token budget plus source chunks. Groq selects only the returned facts that materially affect the task, and those selected facts are shown as evidence and placed in the memory-aware prompt. An unrelated task can have zero selected memories.
+## Set up locally
 
-**Reflect:** Hindsight Reflect is an optional future insight feature. The MVP uses Hindsight Retain and Recall and uses Groq to make the generic versus memory-aware comparison explicit.
-
-Current Hindsight HTTP API: [Retain](https://docs.hindsight.vectorize.io/retain/), [Recall](https://docs.hindsight.vectorize.io/recall/). Groq uses its [chat completions and JSON Object Mode](https://console.groq.com/docs/structured-outputs).
-
-## Run locally
-
-Prerequisites: Python 3.11+, Node 20+, PostgreSQL (or a Supabase connection string), a Hindsight Cloud API key, and a Groq API key.
-
-From the repository root, copy `.env.example` to `.env` and set:
-
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL/Supabase URL, for example `postgresql+psycopg://user:password@localhost:5432/projectpulse` |
-| `HINDSIGHT_API_KEY` | Server-side Hindsight Cloud key |
-| `HINDSIGHT_BASE_URL` | Defaults to `https://api.hindsight.vectorize.io` |
-| `GROQ_API_KEY` | Server-side Groq key |
-| `GROQ_MODEL` | Defaults to `llama-3.3-70b-versatile` |
-| `CORS_ORIGINS` | Comma-separated frontend origins, default `http://localhost:5173` |
-
-Create the PostgreSQL database named in `DATABASE_URL`. SQLAlchemy creates the four MVP tables on API startup. In one terminal:
+Requirements: Python 3.11+, Node 20+, and optionally PostgreSQL/Supabase, a Hindsight Cloud key, and a Groq key. The no-key local demo uses SQLite. Never commit `.env`.
 
 ```bash
+cp .env.example .env
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r ../projectpulse-mcp/requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -66,39 +49,80 @@ In a second terminal:
 ```bash
 cd frontend
 npm ci
-npm run dev
+npm run dev -- --port 5176
 ```
 
-Open `http://localhost:5173`. FastAPI documentation is at `http://localhost:8000/docs`. The frontend uses `http://localhost:8000` by default; set `VITE_API_URL` for another API origin. Never put Hindsight or Groq keys in a `VITE_` variable.
+Open [http://localhost:5176](http://localhost:5176). Set `CORS_ORIGINS=http://localhost:5176` in `.env` if you change ports. The frontend calls `http://localhost:8000` by default; set `VITE_API_URL` only if the backend runs elsewhere.
 
-For a local API smoke test without PostgreSQL, `DATABASE_URL=sqlite:///./projectpulse.db` is supported. PostgreSQL/Supabase is the intended application database.
+Environment variables:
+
+| Name | Purpose |
+| --- | --- |
+| `DATABASE_URL` | SQLite for a local sample or `postgresql+psycopg://...` / Supabase PostgreSQL for normal data |
+| `HINDSIGHT_API_KEY` | Server-side Hindsight Cloud key; blank enables clearly labelled demo mode for new projects |
+| `HINDSIGHT_BASE_URL` | Defaults to `https://api.hindsight.vectorize.io` |
+| `GROQ_API_KEY` | Optional for legacy comparison answers; not used by MCP tools |
+| `GROQ_MODEL` | Model for legacy comparison answers |
+| `CORS_ORIGINS` | Comma-separated allowed dashboard origins |
+
+PostgreSQL/Supabase is the intended application database. SQLAlchemy creates the MVP tables on startup. For a real project, set `DATABASE_URL` to PostgreSQL/Supabase and `HINDSIGHT_API_KEY` before creating it. SQLite relative paths resolve against the repository root so API and stdio MCP processes share one demo database.
+
+## Connect a coding agent
+
+The included [project-scoped Claude configuration](.mcp.json) uses the repo's `backend/.venv/bin/python` executable and [MCP server](projectpulse-mcp/server.py). Run Claude Code from this repository and approve the project MCP server when prompted. For another coding repository, open the dashboard's **MCP setup** tab, select Claude Code or GitHub Copilot, copy the appropriate JSON and replace `/absolute/path/to/ProjectPulse` with this checkout's absolute path. Use a WSL workspace when using the shown Unix Python path.
+
+- Claude Code: save the JSON as `.mcp.json` in the coding repository; save the generated instructions as `CLAUDE.md`.
+- GitHub Copilot in VS Code: save the JSON as `.vscode/mcp.json`; save the generated instructions as `.github/copilot-instructions.md`. Use Agent mode and confirm that the three ProjectPulse tools are available.
+
+The project UUID is displayed in **MCP setup** and must be supplied in every tool call. Tool availability alone does not trigger calls: the instructions tell the agent to recall before coding and retain only durable, non-secret learning afterward. The three tools are:
+
+| Tool | Input | Effect |
+| --- | --- | --- |
+| `recall_project_memory` | `project_id`, `task_description`, optional `top_k` | Returns task-relevant memories and logs the session/tool call |
+| `retain_project_memory` | `project_id`, `content`, `memory_type`, `tags`, optional `source_agent`/`session_id` | Retains a fact in that project's bank and logs provenance |
+| `list_project_memories` | `project_id`, optional `memory_type`/`tag` | Inspects only that project's memories |
+
+Allowed types: `architecture_decision`, `security_rule`, `api_contract`, `incident_fix`, `coding_convention`. The server rejects obvious credential patterns; agents must still avoid personal or sensitive information. The hackathon API has no user authentication, so do not expose it publicly without access control.
+
+The MCP server is a stdio child process launched by a client. To inspect its tools using the official MCP Inspector, install the optional CLI extra and run `mcp dev projectpulse-mcp/server.py`; or use the included true-stdio CLI path below.
 
 ## E-commerce demo
 
-Click **Launch E-commerce demo** to create the project/bank and Retain eight realistic lessons: JWT cookie security, payment connection-pool remediation, the task API contract, React Query state ownership, soft-deleted orders, the failed payment rollback, signed product-image uploads, and local cart state. The project dashboard also has a repeatable **Seed demo data** button.
+Click **Launch E-commerce MCP demo**. In **Memory timeline**, inspect the JWT cookie rule, task API contract, order soft-delete rule, payment-pool fix, and React Query convention. The seed also includes a failed rollback, signed image uploads, and cart state.
 
-To demonstrate the complete handoff, use **Retain learning** as Agent A, choose the JWT example, then select **Agent B - fresh session** and ask “Build the login screen and authentication flow.” The evidence panel shows which Hindsight facts were used, their source and date. The memory-aware answer should apply the HTTP-only cookie rule and avoid localStorage. See the [90-second demo script](docs/demo-script.md).
+Click **Run fresh Agent B MCP demo**. The backend uses the official MCP client to invoke the registered `recall_project_memory` tool. **Agent activity** then shows the fresh session, task, actual tool call, exact JWT evidence, and a clearly labelled local sample code approach that uses HttpOnly/Secure cookies and avoids LocalStorage. The sample result is not an external coding agent.
+
+For a separate stdio-process verification:
+
+```bash
+backend/.venv/bin/python projectpulse-mcp/demo_cli.py
+```
+
+Run that from the repository root after seeding. It starts the MCP server over stdio, makes the real tool call, prints evidence, and logs the labelled sample result. Pass `--project-id UUID` for another project. Refresh **Agent activity** in the dashboard to see it.
+
+See the exact [90-second demo script](docs/demo-script.md).
 
 ## Verify
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-ruff check app tests
-ruff format --check app tests
+ruff check app tests ../projectpulse-mcp
+ruff format --check app tests ../projectpulse-mcp
 python -m unittest discover -s tests -v
 ```
 
 ```bash
 cd frontend
-npm ci
 npm run lint
 npm test
 npm run build
 ```
 
-The automated tests stub external providers only at the network boundary. They check bank routing, seed idempotency, audit events, request schema, unrelated-task abstention, and the seed → Retain → Agent B comparison UI. To validate live provider calls, configure real keys and run the E-commerce demo in the browser.
+Tests use provider stubs for Hindsight and Groq. They exercise project isolation, provider payload shape, retention, seeding, MCP tool audit, and the dashboard. A live Hindsight account/credentials are required to verify cloud Retain/Recall/List; none are bundled.
 
-## Out of scope
+## Intentionally out of scope
 
-IDE/Claude Code/Antigravity integrations, repository-wide ingestion, live GitHub hooks, autonomous code changes, user login and permissions, and Reflect insights. The API is unauthenticated for this hackathon demo; put access control in front of it before public deployment.
+Automatic tool invocation without agent instructions, autonomous repository edits by the dashboard, repository ingestion, hosted multi-user authentication, production-grade authorization, and Hindsight Reflect insights. The dashboard does not impersonate Claude Code, Copilot, or another coding agent.
+
+Official integration references: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [VS Code MCP configuration](https://code.visualstudio.com/docs/agent-customization/mcp-servers), [Hindsight Retain](https://docs.hindsight.vectorize.io/retain/), [Recall](https://docs.hindsight.vectorize.io/recall/), and [List memories](https://docs.hindsight.vectorize.io/api-reference/list-memories/).

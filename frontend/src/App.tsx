@@ -190,6 +190,7 @@ export default function App() {
     });
   }, [memories, search, typeFilter]);
 
+  const visibleActivities = activities.filter((item) => item.tool_name !== "demo.seed");
   const latestRecall = events.find((event) => event.event_type === "recalled");
   const latestMcpRecall = activities.find(
     (activity) => activity.tool_name === "projectpulse.recall_project_memory"
@@ -355,7 +356,7 @@ export default function App() {
                 <article className="panel number-panel">
                   <p className="eyebrow">RETAINED MEMORIES</p>
                   <strong>{memories.length}</strong>
-                  <p>Inspectable facts in the selected project bank.</p>
+                  <p>Inspectable facts in the selected project bank. {stats.retained} retain events logged.</p>
                 </article>
                 <article className="panel">
                   <p className="eyebrow">LATEST RECALL</p>
@@ -475,7 +476,7 @@ export default function App() {
               </div>
               <div className="activity-layout">
                 <div className="activity-stream">
-                  {activities.length ? [...activities].reverse().map((item, index) => (
+                  {visibleActivities.length ? [...visibleActivities].reverse().map((item, index) => (
                     <article key={item.id} className={"activity-item " + item.kind}>
                       <span className="step-index">{String(index + 1).padStart(2, "0")}</span>
                       <div>
@@ -704,6 +705,3 @@ function MemoryDetail({ memory, close }: { memory: Memory; close: () => void }) 
     </div>
   </div>;
 }
-
-
-
