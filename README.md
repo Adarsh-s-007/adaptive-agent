@@ -126,3 +126,11 @@ Tests use provider stubs for Hindsight and Groq. They exercise project isolation
 Automatic tool invocation without agent instructions, autonomous repository edits by the dashboard, repository ingestion, hosted multi-user authentication, production-grade authorization, and Hindsight Reflect insights. The dashboard does not impersonate Claude Code, Copilot, or another coding agent.
 
 Official integration references: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [VS Code MCP configuration](https://code.visualstudio.com/docs/agent-customization/mcp-servers), [Hindsight Retain](https://docs.hindsight.vectorize.io/retain/), [Recall](https://docs.hindsight.vectorize.io/recall/), and [List memories](https://docs.hindsight.vectorize.io/api-reference/list-memories/).
+
+### Enable real Hindsight Cloud memory
+
+Create a repository-root .env file from .env.example, then set only the server-side value below. Do not add it to the frontend environment, paste it into chat, or commit it.
+
+    HINDSIGHT_API_KEY=hsk_your_key_here
+
+Restart the backend and open http://localhost:8000/health/hindsight. A successful response has status connected; this performs a read-only provider check and does not retain any memory. Then create a new project from the dashboard. Its bank is created in Hindsight Cloud, and Retain, Recall, and List use that bank only. Existing demo-prefixed projects intentionally remain local demo projects.

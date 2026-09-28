@@ -331,6 +331,19 @@ class DemoModeTests(unittest.TestCase):
 
 
 class ProviderContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hindsight_probe_is_read_only_and_does_not_expose_credentials(self):
+        service = HindsightService()
+        service._request = AsyncMock(return_value={"items": []})
+
+        status = await service.probe()
+
+        self.assertEqual(status["status"], "connected")
+        self.assertTrue(status["configured"])
+        self.assertNotIn("key", status["message"].lower())
+        service._request.assert_awaited_once_with(
+            "GET", "/banks", params=[("limit", "1")]
+        )
+
     async def test_hindsight_recall_uses_current_schema_and_provenance(self):
         service = HindsightService()
         service._request = AsyncMock(

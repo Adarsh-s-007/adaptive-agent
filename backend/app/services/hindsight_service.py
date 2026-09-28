@@ -60,6 +60,29 @@ class HindsightService:
         except (httpx.HTTPError, ValueError) as exc:
             raise HTTPException(503, "Hindsight is temporarily unreachable.") from exc
 
+    async def probe(self) -> dict[str, str | bool]:
+        """Verify provider reachability without retaining project data or exposing a key."""
+        if not self.settings.hindsight_api_key:
+            return {
+                "configured": False,
+                "status": "not_configured",
+                "message": "Add HINDSIGHT_API_KEY to the server .env file.",
+            }
+        try:
+            # Listing one bank is a read-only authentication and connectivity check.
+            await self._request("GET", "/banks", params=[("limit", "1")])
+        except HTTPException as exc:
+            return {
+                "configured": True,
+                "status": "unavailable",
+                "message": str(exc.detail),
+            }
+        return {
+            "configured": True,
+            "status": "connected",
+            "message": "Hindsight Cloud is reachable.",
+        }
+
     @staticmethod
     def bank_slug(name: str, project_id: str) -> str:
         safe = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:42] or "project"

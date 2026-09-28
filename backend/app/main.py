@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
 from app.config import get_settings
 from app.db.database import Base, engine
+from app.services.hindsight_service import HindsightService
 
 settings = get_settings()
 Base.metadata.create_all(bind=engine)
@@ -27,3 +28,9 @@ def health():
         "hindsight_configured": bool(settings.hindsight_api_key),
         "groq_configured": bool(settings.groq_api_key),
     }
+
+
+@app.get("/health/hindsight")
+async def hindsight_health():
+    """Read-only Hindsight connectivity check for local setup verification."""
+    return await HindsightService().probe()
