@@ -7,7 +7,6 @@ import json
 from sqlalchemy.orm import Session
 
 from app.db.governed_models import ComparisonRun
-from app.gateways.project_context import BankResolver
 from app.schemas.common import CompareResult
 from app.services.check_service import CheckService
 from app.services.generation_service import GenerationService

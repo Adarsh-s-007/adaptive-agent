@@ -400,6 +400,13 @@ class TestBlueprintImplementation(unittest.TestCase):
         res_cands = self.client.get(f"/api/v1/projects/{proj.id}/candidates")
         self.assertEqual(res_cands.status_code, 200)
 
+    @classmethod
+    def tearDownClass(cls):
+        app.dependency_overrides.clear()
+        cls.client.close()
+        cls.engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main()
+

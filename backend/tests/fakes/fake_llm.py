@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Type, TypeVar
-from pydantic import BaseModel
+from typing import Any, TypeVar
 
 from app.core.errors import AppError, AppErrorCode
 from app.gateways.llm_gateway import LLMResult
+from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -28,7 +28,7 @@ class FakeLLM:
         self,
         tier: str,
         messages: list[dict[str, str]],
-        schema: Type[T],
+        schema: type[T],
         *,
         job: str,
         temperature: float = 0.0,

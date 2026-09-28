@@ -16,9 +16,6 @@ os.environ["DATABASE_URL"] = "sqlite:///" + str(
 os.environ["HINDSIGHT_API_KEY"] = "test-hindsight-key"
 os.environ["GROQ_API_KEY"] = "test-groq-key"
 
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
-
 from app.api import routes
 from app.db.database import SessionLocal, engine
 from app.main import app
@@ -26,6 +23,8 @@ from app.models.entities import Project
 from app.services import mcp_server
 from app.services.groq_service import GroqService
 from app.services.hindsight_service import HindsightService
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 
 class FakeHindsight:
@@ -138,6 +137,10 @@ class FlowTests(unittest.TestCase):
         _test_dir.cleanup()
 
     def test_fresh_agent_recall_and_bank_isolation(self):
+        with SessionLocal() as db:
+            db.query(Project).filter(Project.name.in_(["E-commerce Platform", "Inventory Tool"])).delete()
+            db.commit()
+
         ecom_response = self.client.post(
             "/projects",
             json={"name": "E-commerce Platform", "description": "Storefront demo"},

@@ -68,7 +68,7 @@ class HindsightGateway:
         if not self.settings.hindsight_api_key:
             return {"status": "unconfigured", "configured": False}
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(
                     f"{self._base_url()}/banks",
                     headers=self._headers(),
@@ -201,17 +201,33 @@ class HindsightGateway:
 
         for idx, item in enumerate(raw_results, start=1):
             meta = item.get("metadata") or {}
+            item_tags = item.get("tags") or []
+
+            # Extract project_id from metadata or tags (format: project:<project_id>)
             rec_proj = meta.get("project_id")
-            
-            # Metadata isolation assertion (Blueprint §15.3 / C-5)
+            if not rec_proj:
+                for t in item_tags:
+                    if t.startswith("project:"):
+                        rec_proj = t.split(":", 1)[1]
+                        break
+
+            # Metadata and tag isolation assertion (Blueprint §15.3 / C-5)
             if not ctx.assert_record_isolated(rec_proj):
                 self._isolation_violations += 1
                 continue  # Drop foreign project result
 
             doc_id = item.get("document_id") or ""
-            rec_id = meta.get("record_id") or doc_id.replace("mem_", "")
-            
-            status = meta.get("status", "active")
+            rec_id = meta.get("record_id") or (doc_id.replace("mem_", "") if doc_id else "")
+
+            # Extract status from metadata or tags (format: status:<status>)
+            status = meta.get("status")
+            if not status:
+                for t in item_tags:
+                    if t.startswith("status:"):
+                        status = t.split(":", 1)[1]
+                        break
+            status = status or "active"
+
             if exclude_status and status in exclude_status:
                 continue
 
@@ -224,12 +240,187 @@ class HindsightGateway:
                     score=float((item.get("scores") or {}).get("final", 0.0)),
                     source_fact_ids=[item.get("id")] if item.get("id") else [],
                     metadata=meta,
-                    tags=item.get("tags") or [],
+                    tags=item_tags,
                     document_id=doc_id,
                 )
             )
 
         return facts
+
+    async def provision_bank(
+        self,
+        ctx: ProjectContext,
+        project_name: str,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Full bank provisioning sequence per Blueprint §15.2 (HS-4).
+        
+        1. Create bank with missions and dispositions
+        2. Attach 3 standard directives
+        3. Provision Rulebook mental model
+        """
+        if self.is_forced_offline or not self.settings.hindsight_api_key:
+            return {"status": "ready", "origin": "offline", "directives": 3, "mental_model": "rulebook"}
+
+        # 1. Create bank
+        url = f"{self._base_url()}/banks/{ctx.bank_id}"
+        mission_text = f"Retain engineering decisions, architecture rules, and conventions for {project_name}."
+        reflect_text = f"Answer architectural and coding queries strictly citing verified decisions for {project_name}."
+        
+        payload = {
+            "name": project_name,
+            "retain_mission": mission_text,
+            "reflect_mission": reflect_text,
+            "background": description or f"Engineering memory for {project_name}.",
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.put(url, headers=self._headers(), json=payload)
+            if res.status_code >= 400:
+                raise AppError(
+                    code=AppErrorCode.HINDSIGHT_UNAVAILABLE,
+                    message=f"Failed to create Hindsight bank: HTTP {res.status_code}",
+                    status_code=502,
+                )
+
+        # 2. Attach 3 directives (§15.2)
+        directives = [
+            ("cite_decisions", "Always cite specific architectural decisions and rule statements when explaining technical guidance."),
+            ("obsolete_superseded", "Treat superseded records as obsolete historical context; never recommend deprecated patterns."),
+            ("no_secrets", "Never retain secrets, credentials, API keys, or raw personal data."),
+        ]
+        directives_created = 0
+        for d_name, d_content in directives:
+            try:
+                await self.create_directive(ctx, name=d_name, content=d_content)
+                directives_created += 1
+            except Exception:
+                pass
+
+        # 3. Create Rulebook mental model
+        mm_id = None
+        try:
+            mm_resp = await self.create_mental_model(
+                ctx=ctx,
+                name="Project Rulebook",
+                source_query="Summarize all active engineering rules, constraints, and architecture decisions.",
+                description="High-level architectural standards and engineering rules of the project.",
+            )
+            mm_id = mm_resp.get("mental_model_id")
+        except Exception:
+            pass
+
+        return {
+            "status": "ready",
+            "bank_id": ctx.bank_id,
+            "directives_created": directives_created,
+            "mental_model_id": mm_id,
+        }
+
+    async def create_directive(
+        self,
+        ctx: ProjectContext,
+        name: str,
+        content: str,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        """Attach a directive to the project bank."""
+        if self.is_forced_offline or not self.settings.hindsight_api_key:
+            return {"name": name, "status": "stored_offline"}
+
+        url = f"{self._base_url()}/banks/{ctx.bank_id}/directives"
+        payload = {"name": name, "content": content, "priority": priority}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(url, headers=self._headers(), json=payload)
+            if res.status_code >= 400:
+                raise AppError(
+                    code=AppErrorCode.HINDSIGHT_UNAVAILABLE,
+                    message=f"Failed to create directive: HTTP {res.status_code}",
+                    status_code=502,
+                )
+            return res.json()
+
+    async def list_directives(self, ctx: ProjectContext) -> list[dict[str, Any]]:
+        """List directives configured on this project bank."""
+        if self.is_forced_offline or not self.settings.hindsight_api_key:
+            return []
+        url = f"{self._base_url()}/banks/{ctx.bank_id}/directives"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(url, headers=self._headers())
+                if res.status_code < 400:
+                    data = res.json()
+                    return data.get("directives", data if isinstance(data, list) else [])
+        except Exception:
+            pass
+        return []
+
+    async def create_mental_model(
+        self,
+        ctx: ProjectContext,
+        name: str,
+        source_query: str,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Create a mental model (Rulebook synthesis) on this project bank."""
+        if self.is_forced_offline or not self.settings.hindsight_api_key:
+            return {"name": name, "mental_model_id": "mm-offline"}
+
+        url = f"{self._base_url()}/banks/{ctx.bank_id}/mental-models"
+        payload = {
+            "name": name,
+            "source_query": source_query,
+            "description": description or name,
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(url, headers=self._headers(), json=payload)
+            if res.status_code >= 400:
+                raise AppError(
+                    code=AppErrorCode.HINDSIGHT_UNAVAILABLE,
+                    message=f"Failed to create mental model: HTTP {res.status_code}",
+                    status_code=502,
+                )
+            return res.json()
+
+    async def list_mental_models(self, ctx: ProjectContext) -> list[dict[str, Any]]:
+        """List mental models on this project bank."""
+        if self.is_forced_offline or not self.settings.hindsight_api_key:
+            return []
+        url = f"{self._base_url()}/banks/{ctx.bank_id}/mental-models"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(url, headers=self._headers())
+                if res.status_code < 400:
+                    data = res.json()
+                    return data.get("items", [])
+        except Exception:
+            pass
+        return []
+
+    async def rulebook_get(self, ctx: ProjectContext) -> str:
+        """Fetch Rulebook text from project reflection synthesis (RF-2)."""
+        res = await self.reflect(
+            ctx=ctx,
+            query="Provide the definitive Rulebook of all architectural constraints and engineering standards for this project.",
+            max_tokens=1500,
+        )
+        return res.get("answer", "No rulebook synthesis available.")
+
+    async def ask(
+        self,
+        ctx: ProjectContext,
+        query: str,
+        max_tokens: int = 1200,
+    ) -> dict[str, Any]:
+        """Ask technical question to project memory with citation mapping (RF-1)."""
+        reflect_res = await self.reflect(ctx=ctx, query=query, max_tokens=max_tokens)
+        directives = await self.list_directives(ctx)
+        
+        return {
+            "answer": reflect_res.get("answer", ""),
+            "based_on": reflect_res.get("based_on", []),
+            "guardrails_applied": [d.get("content", d.get("name", "")) for d in directives],
+        }
 
     async def retag_document(
         self,
@@ -242,10 +433,10 @@ class HindsightGateway:
             return True
 
         doc_id = format_document_id(record_id)
-        url = f"{self._base_url()}/banks/{ctx.bank_id}/documents/{doc_id}/tags"
+        url = f"{self._base_url()}/banks/{ctx.bank_id}/documents/{doc_id}"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.put(url, headers=self._headers(), json={"tags": new_tags})
+                res = await client.patch(url, headers=self._headers(), json={"tags": new_tags})
                 return res.status_code < 400
         except Exception:
             return False
@@ -272,7 +463,13 @@ class HindsightGateway:
                     json={"query": query, "max_tokens": max_tokens, "include_facts": True},
                 )
                 if res.status_code < 400:
-                    return res.json()
+                    data = res.json()
+                    facts = data.get("facts", [])
+                    citations = [f.get("document_id") or f.get("id") for f in facts if f]
+                    return {
+                        "answer": data.get("text") or data.get("answer", ""),
+                        "based_on": citations,
+                    }
         except Exception:
             pass
 
@@ -280,3 +477,4 @@ class HindsightGateway:
             "answer": "Could not complete reflection query against Hindsight bank.",
             "based_on": [],
         }
+

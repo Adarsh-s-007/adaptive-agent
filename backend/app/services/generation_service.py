@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 
 from app.db.governed_models import TaskRun
 from app.gateways.llm_gateway import LLMGateway
-from app.gateways.project_context import BankResolver
 from app.schemas.common import BriefResult, RunOutput, TaskRunOut
 from app.services.brief_service import BriefService
 

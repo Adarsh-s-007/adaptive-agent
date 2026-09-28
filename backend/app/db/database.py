@@ -25,6 +25,28 @@ class Base(DeclarativeBase):
     pass
 
 
+def ensure_sqlite_columns() -> None:
+    """Ensure newly added columns exist in SQLite for backwards-compatibility."""
+    if not database_url.startswith("sqlite"):
+        return
+    try:
+        with engine.connect() as conn:
+            res = conn.exec_driver_sql("PRAGMA table_info(projects)")
+            cols = {row[1] for row in res.fetchall()}
+            if cols:
+                if "bank_status" not in cols:
+                    conn.exec_driver_sql("ALTER TABLE projects ADD COLUMN bank_status VARCHAR(32) DEFAULT 'ready'")
+                if "rulebook_cache" not in cols:
+                    conn.exec_driver_sql("ALTER TABLE projects ADD COLUMN rulebook_cache TEXT")
+                conn.commit()
+    except Exception:
+        pass
+
+
+ensure_sqlite_columns()
+
+
+
 def get_db():
     db = SessionLocal()
     try:

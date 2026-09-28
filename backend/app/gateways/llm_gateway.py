@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -129,7 +129,7 @@ class LLMGateway:
                         message=f"LLM completion failed: {e!s}",
                         status_code=503,
                     )
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
 
         # Parse & validate JSON
         try:

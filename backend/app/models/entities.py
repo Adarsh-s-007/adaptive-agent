@@ -21,6 +21,8 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(150), unique=True, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     hindsight_bank_id: Mapped[str] = mapped_column(String(180), unique=True)
+    bank_status: Mapped[str] = mapped_column(String(30), default="ready")  # provisioning, ready, error
+    rulebook_cache: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

@@ -1,14 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+import app.db.governed_models
 from app.api.routes import router
 from app.api.v1 import v1_router
 from app.config import get_settings
 from app.core.errors import AppError
 from app.db.database import Base, engine
-import app.db.governed_models  # noqa: F401
 from app.services.hindsight_service import HindsightService
-from fastapi.responses import JSONResponse
 
 settings = get_settings()
 Base.metadata.create_all(bind=engine)

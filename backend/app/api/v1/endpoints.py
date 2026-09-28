@@ -35,6 +35,7 @@ from app.services.extraction_validator import ExtractionValidator
 from app.services.generation_service import GenerationService
 from app.services.governed_memory_service import GovernedMemoryService
 from app.services.project_memory_service import project_or_404
+from app.services.project_service import ProjectService
 from app.services.review_service import ReviewService
 from app.services.signals import TranscriptPreparer
 from app.services.transcript_parser import TranscriptParser
@@ -46,6 +47,7 @@ DBSession = Annotated[Session, Depends(get_db)]
 hindsight_gw = HindsightGateway()
 llm_gw = LLMGateway()
 mem_service = GovernedMemoryService(hindsight_gw)
+project_service = ProjectService(hindsight_gw)
 brief_service = BriefService(hindsight_gw, llm_gw, mem_service)
 check_service = CheckService(hindsight_gw, llm_gw, mem_service)
 gen_service = GenerationService(llm_gw, brief_service)
@@ -386,3 +388,56 @@ async def review_candidate(pid: str, cid: str, body: CandidateReviewRequest, db:
         reviewer=body.reviewer,
     )
     return {"status": "approved", "resolution": body.resolution, "id": getattr(res, "id", "")}
+
+
+# --- Project Provisioning, Rulebook & Ask Endpoints (HS-4, RF-1, RF-2) ---
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=2000)
+
+
+class OfflineToggleRequest(BaseModel):
+    force_offline: bool
+
+
+@router.post("/projects/{pid}/provision")
+async def provision_project(pid: str, db: DBSession):
+    """Idempotent retry for project bank provisioning (HS-4)."""
+    proj = await project_service.provision_project(db, pid)
+    return {
+        "project_id": proj.id,
+        "bank_id": proj.hindsight_bank_id,
+        "bank_status": proj.bank_status,
+    }
+
+
+@router.get("/projects/{pid}/rulebook")
+async def get_rulebook(pid: str, db: DBSession):
+    """Fetch synthesized Project Rulebook (RF-2)."""
+    return await project_service.get_rulebook(db, pid)
+
+
+@router.post("/projects/{pid}/rulebook/refresh")
+async def refresh_rulebook(pid: str, db: DBSession):
+    """Force re-synthesis of Project Rulebook (RF-2)."""
+    return await project_service.refresh_rulebook(db, pid)
+
+
+@router.post("/projects/{pid}/ask")
+async def ask_project(pid: str, body: AskRequest, db: DBSession):
+    """Ask technical question with memory reflection and citation mapping (RF-1)."""
+    return await project_service.ask(db, pid, body.question)
+
+
+@router.get("/admin/hindsight/offline")
+def get_hindsight_offline_status():
+    """Get status of HINDSIGHT_FORCE_OFFLINE toggle (HS-6)."""
+    return {"force_offline": hindsight_gw.is_forced_offline}
+
+
+@router.post("/admin/hindsight/offline")
+def toggle_hindsight_offline(body: OfflineToggleRequest):
+    """Set HINDSIGHT_FORCE_OFFLINE toggle for degradation testing (HS-6)."""
+    hindsight_gw.set_force_offline(body.force_offline)
+    return {"force_offline": hindsight_gw.is_forced_offline}
+

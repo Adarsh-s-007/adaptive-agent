@@ -63,12 +63,13 @@ async def list_project_memories(
 
 @mcp.tool()
 async def projectpulse_brief(
-    project_id: str, task: str, file_paths: list[str] = []
+    project_id: str, task: str, file_paths: list[str] | None = None
 ) -> dict:
     """Obtain task Brief before implementing code: applied rules, reasons, and provenance (Blueprint §22)."""
-    from app.services.brief_service import BriefService
+    file_paths = file_paths or []
     from app.gateways.hindsight_gateway import HindsightGateway
     from app.gateways.llm_gateway import LLMGateway
+    from app.services.brief_service import BriefService
     from app.services.governed_memory_service import GovernedMemoryService
 
     h_gw = HindsightGateway()
@@ -85,9 +86,9 @@ async def projectpulse_check(
     project_id: str, content: str
 ) -> dict:
     """Check code or proposed changes against governed project decisions before finalizing (Blueprint §22)."""
-    from app.services.check_service import CheckService
     from app.gateways.hindsight_gateway import HindsightGateway
     from app.gateways.llm_gateway import LLMGateway
+    from app.services.check_service import CheckService
     from app.services.governed_memory_service import GovernedMemoryService
 
     h_gw = HindsightGateway()
@@ -104,11 +105,11 @@ async def projectpulse_submit_session(
     project_id: str, transcript: str, title: str = "Agent Session", format_hint: str = "markdown"
 ) -> dict:
     """Submit transcript from any coding agent to import turns and extract candidates into the human review Inbox (Blueprint §22)."""
-    from app.services.transcript_parser import TranscriptParser
-    from app.services.signals import TranscriptPreparer
-    from app.services.extraction_validator import ExtractionValidator
+    from app.db.governed_models import MemoryCandidate, SessionTurn
     from app.models.entities import AgentSession
-    from app.db.governed_models import SessionTurn, MemoryCandidate
+    from app.services.extraction_validator import ExtractionValidator
+    from app.services.signals import TranscriptPreparer
+    from app.services.transcript_parser import TranscriptParser
 
     with SessionLocal() as db:
         parsed_turns = TranscriptParser.parse(transcript, format_hint)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
+
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -14,7 +14,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.ids import generate_uuidv7, generate_record_pill
+from app.core.ids import generate_record_pill, generate_uuidv7
 from app.db.database import Base
 
 
