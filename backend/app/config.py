@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # --- API surface ---------------------------------------------------------
     app_access_token: str | None = None
     cors_origins: str = "http://localhost:5173,http://localhost:5176"
+    # Vite chooses the next open local port during development. Keep this narrow
+    # to common Vite ports while allowing both browser host spellings.
+    cors_origin_regex: str | None = r"^https?://(localhost|127\.0\.0\.1):517[3-9]$"
     demo_mode: bool = True
     max_body_bytes: int = 1_048_576
     llm_rate_limit_per_minute: int = 30
